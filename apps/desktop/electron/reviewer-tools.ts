@@ -2,7 +2,7 @@ import { open, readFile, readdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, isAbsolute, relative } from 'node:path';
 import { Worker } from 'node:worker_threads';
-import { runSearch, type SearchRequest } from './reviewer-search.js';
+import { runSearch, toPosixRel, type SearchRequest } from './reviewer-search.js';
 import { confinePath } from './fs-scope.js';
 import type { FraktoleMessage, ReviewerQuestion, ReviewerState, ReviewerTask } from '../src/shared/ipc.js';
 import { sanitizeChatText } from '../src/shared/sanitize.js';
@@ -762,7 +762,7 @@ async function listDir(abs: string, depth: number, includeHidden: boolean): Prom
       }
       if (!includeHidden && e.name.startsWith('.')) continue;
       const full = join(dir, e.name);
-      const rel = relative(abs, full);
+      const rel = toPosixRel(relative(abs, full));
       if (e.isDirectory()) {
         // heavy dirs are always skipped from the listing — the depth guard
         // only governs recursion (audit RV-27)

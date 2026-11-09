@@ -3,18 +3,23 @@ import { mkdtemp, mkdir, writeFile, readFile, stat, rm, chmod, symlink } from 'n
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { forkExists, forkProject } from '../electron/fork.js';
+
+const execFileP = promisify(execFile);
 
 async function gitInit(dir: string, file: string, content: string): Promise<void> {
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, file), content, 'utf8');
-  await execFile('git', ['init', '-q', dir]);
-  await execFile('git', ['-C', dir, 'config', 'user.email', 't@t.t']);
-  await execFile('git', ['-C', dir, 'config', 'user.name', 't']);
+  // execFile is callback-based: awaiting it directly does not wait for git to
+  // finish, so `config` could race `init` (lost on slower Windows spawns)
+  await execFileP('git', ['init', '-q', dir]);
+  await execFileP('git', ['-C', dir, 'config', 'user.email', 't@t.t']);
+  await execFileP('git', ['-C', dir, 'config', 'user.name', 't']);
   // tmpfs stat-cache races can make add/commit land on a stale index —
   // retry until the worktree is genuinely clean and committed
   for (let attempt = 0; ; attempt += 1) {
-    await execFile('git', ['-C', dir, 'add', '.']);
+    await execFileP('git', ['-C', dir, 'add', '.']);
     await new Promise<void>((resolve) => {
       execFile('git', ['-C', dir, 'commit', '-qm', 'init'], () => resolve());
     });

@@ -62,6 +62,9 @@ describe('collectGitStatus', () => {
     const repo = join(parent, 'proj');
     await mkdir(repo);
     await execFileP('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+    // a local identity: the machine running the tests may have none configured
+    await execFileP('git', ['config', 'user.email', 't@t.t'], { cwd: repo });
+    await execFileP('git', ['config', 'user.name', 't'], { cwd: repo });
     await writeFile(join(repo, 'tracked.txt'), 'one\n');
     await execFileP('git', ['add', '-A'], { cwd: repo });
     await execFileP('git', ['commit', '-q', '-m', 'init'], { cwd: repo });

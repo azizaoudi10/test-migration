@@ -1,5 +1,5 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { join, relative, sep } from 'node:path';
 
 /**
  * The reviewer's file search engine, isolated from the main process.
@@ -37,6 +37,13 @@ function capResult(text: string): string {
 
 /** Brace alternation: `*.{ts,tsx}` must match both extensions — escaping the
  *  braces made the advertised filter match nothing (audit RV-09). */
+/** Relative paths shown to the model always use '/', whatever the OS: on
+ *  Windows path.relative() yields 'src\\app.ts', which the model would then
+ *  echo back inconsistently (and tool output must not depend on the host). */
+export function toPosixRel(rel: string): string {
+  return sep === '/' ? rel : rel.split(sep).join('/');
+}
+
 export function globToRe(glob: string): string {
   const brace = /\{([^{}]*)\}/.exec(glob);
   if (brace) {
@@ -115,7 +122,7 @@ export async function runSearch(req: SearchRequest): Promise<string> {
             // test a capped slice: a pathological pattern against a huge
             // single line must not hang the search engine
             if (re.test(line.slice(0, SEARCH_LINE_TEST_CAP))) {
-              hits.push(`${relative(abs, full)}:${i + 1}: ${line.slice(0, SEARCH_LINE_CAP)}`);
+              hits.push(`${toPosixRel(relative(abs, full))}:${i + 1}: ${line.slice(0, SEARCH_LINE_CAP)}`);
             }
           }
         } catch {

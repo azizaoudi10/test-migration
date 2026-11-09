@@ -618,7 +618,9 @@ describe('start failures', () => {
   it('rejects with EADDRINUSE when the port is already taken (surfaced as status.error)', async () => {
     const { createServer } = await import('node:net');
     const blocker = createServer();
-    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+    // same host as the bridge (0.0.0.0): Windows lets a wildcard bind coexist
+    // with a 127.0.0.1 listener on the same port, Linux does not
+    await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
     const port = (blocker.address() as { port: number }).port;
     try {
       const dir = await mkdtemp(join(tmpdir(), 'frakt-bridge-busy-'));

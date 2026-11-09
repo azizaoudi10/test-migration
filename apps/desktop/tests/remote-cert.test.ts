@@ -19,7 +19,8 @@ describe('loadOrCreateCert', () => {
     expect(parsed.fingerprint256.replaceAll(':', '').toLowerCase()).toBe(cert.fingerprint256);
 
     const keyStat = await stat(join(dir, 'key.pem'));
-    expect(keyStat.mode & 0o777).toBe(0o600);
+    // POSIX permission bits do not exist on Windows (NTFS ACLs; stat reports 0o666)
+    if (process.platform !== 'win32') expect(keyStat.mode & 0o777).toBe(0o600);
     const keyPem = await readFile(join(dir, 'key.pem'), 'utf8');
     expect(keyPem).toContain('BEGIN PRIVATE KEY');
     await rm(dir, { recursive: true, force: true });

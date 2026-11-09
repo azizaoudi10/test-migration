@@ -18,7 +18,13 @@ export const LINE_END = IS_WINDOWS ? '\r' : '\n';
 export function findOnPath(name: string, env: NodeJS.ProcessEnv = process.env): string | null {
   const dirs = (env.PATH ?? env.Path ?? '').split(delimiter).filter((d) => d.length > 0);
   const exts = IS_WINDOWS
-    ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter((e) => e.length > 0)
+    ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+        .split(';')
+        .filter((e) => e.length > 0)
+        // PATHEXT is upper-case by convention; the file system is
+        // case-insensitive, so probe lower-case to return the conventional
+        // on-disk spelling (claude.cmd, not claude.CMD)
+        .map((e) => e.toLowerCase())
     : [''];
   const hasExt = IS_WINDOWS && /\.[a-z0-9]+$/i.test(name);
   for (const dir of dirs) {

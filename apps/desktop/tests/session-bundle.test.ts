@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { exportSessionBundle, importSessionBundle, MAX_BUNDLE_BYTES } from '../electron/session-bundle.js';
 import { newSessionId, touchSessionIndex } from '../electron/sessions.js';
 import { execFile } from 'node:child_process';
+import { tarBinary } from '../electron/platform.js';
 
 async function makeSessionDir(root: string, id: string): Promise<string> {
   const dir = join(root, id);
@@ -89,7 +90,8 @@ describe('session bundle export/import', () => {
     const bundle = join(root, 'bad.tar.gz');
     const { execFile } = await import('node:child_process');
     await new Promise<void>((resolve, reject) =>
-      execFile('tar', ['-czf', bundle, '-C', join(root, 'src'), 's-malformed'], (err) => (err ? reject(err) : resolve())),
+      // tarBinary(): on Windows a bare `tar` may be Git's GNU tar, which reads C:\… as a remote host
+      execFile(tarBinary(), ['-czf', bundle, '-C', join(root, 'src'), 's-malformed'], (err) => (err ? reject(err) : resolve())),
     );
     const res = await importSessionBundle(sessionsRoot, bundle);
     if (res.ok) throw new Error('expected the malformed bundle to be rejected');

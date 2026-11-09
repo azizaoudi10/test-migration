@@ -12,6 +12,9 @@ async function makeRepo(parent: string, name: string): Promise<string> {
   const dir = join(parent, name);
   await mkdir(dir, { recursive: true });
   await execFileP('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  // a local identity: the machine running the tests may have none configured
+  await execFileP('git', ['config', 'user.email', 't@t.t'], { cwd: dir });
+  await execFileP('git', ['config', 'user.name', 't'], { cwd: dir });
   await writeFile(join(dir, 'README.md'), 'x\n');
   await execFileP('git', ['add', '-A'], { cwd: dir });
   await execFileP('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
