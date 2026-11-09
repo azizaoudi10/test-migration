@@ -1,0 +1,7 @@
+# Keep LF everywhere (shell scripts, AppRun and prettier-formatted sources
+# must not be checked out with CRLF on Windows)
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.woff2 binary
+*.jar binary

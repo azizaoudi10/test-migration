@@ -25,7 +25,8 @@ function runLauncher(env: Record<string, string>): Promise<{ code: number; stder
   });
 }
 
-describe('launcher.sh under a menu-like environment', () => {
+// launcher.sh is the Linux desktop/AppImage entry point (bash)
+describe.skipIf(process.platform === 'win32')('launcher.sh under a menu-like environment', () => {
   it('execs the binary without unbound-variable aborts (no TERM/COLORTERM)', async () => {
     const { code, stderr } = await runLauncher({
       HOME: '/home/test',

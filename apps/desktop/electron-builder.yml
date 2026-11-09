@@ -8,6 +8,7 @@ files:
   - dist-renderer/**
   - package.json
   - build/icon.png
+  - build/icon.ico
   # every prod dependency is bundled into dist-electron/main.cjs (esbuild)
   # or dist-renderer (vite) except the native node-pty — shipping the rest
   # of node_modules was ~12MB of dead weight (dev builds, .map files,
@@ -15,10 +16,10 @@ files:
   - '!node_modules/**'
   - node_modules/node-pty/**
   # the loader only consults build/Release, build/Debug and
-  # prebuilds/<platform>-<arch>; foreign prebuilds, sources, winpty deps,
-  # helper scripts and test files are dead weight
-  - '!node_modules/node-pty/prebuilds/darwin-*/**'
-  - '!node_modules/node-pty/prebuilds/win32-*/**'
+  # prebuilds/<platform>-<arch>; sources, winpty sources, helper scripts and
+  # test files are dead weight (foreign-platform prebuilds are dropped per
+  # target below). On Windows build/Release carries conpty.node,
+  # conpty_console_list.node, winpty.dll and winpty-agent.exe — kept.
   - '!node_modules/node-pty/src/**'
   - '!node_modules/node-pty/deps/**'
   - '!node_modules/node-pty/scripts/**'
@@ -34,20 +35,41 @@ electronLanguages:
 # only passes --no-sandbox when they are unavailable
 toolsets:
   appimage: 1.0.3
-# code signing configuration (placeholder; fill in with real certificates)
+# node-pty spawns helper executables (winpty-agent.exe, conpty helpers) and
+# loads .node addons by real path: neither works from inside app.asar
+asarUnpack:
+  - node_modules/node-pty/**
+# Windows 10 1809+ / 11 (ConPTY). Code signing: set CSC_LINK / CSC_KEY_PASSWORD
+# (or WIN_CSC_LINK) in the environment; unsigned builds work but trigger
+# SmartScreen on first launch.
 win:
   target:
-    - nsis
-  icon: build/icon.png
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: build/icon.ico
+  executableName: Fraktole
   artifactName: ${productName}-${version}-${arch}.${ext}
+  files:
+    - '!node_modules/node-pty/prebuilds/darwin-*/**'
+    - '!node_modules/node-pty/prebuilds/linux-*/**'
+    - '!node_modules/node-pty/prebuilds/win32-arm64/**'
+    - '!node_modules/node-pty/**/*.pdb'
+portable:
+  artifactName: ${productName}-${version}-${arch}-portable.${ext}
 nsis:
   oneClick: false
-  perMachine: true
+  # per-user by default (no admin prompt); the assisted installer still
+  # offers "all users" with elevation
+  perMachine: false
   allowElevation: true
+  shortcutName: Fraktole
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
   allowToChangeInstallationDirectory: true
-  installerIcon: build/icon.png
-  uninstallerIcon: build/icon.png
-  installerHeaderIcon: build/icon.png
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
   createDesktopShortcut: true
   createStartMenuShortcut: true
 mac:
@@ -56,6 +78,9 @@ mac:
   icon: build/icon.png
   artifactName: ${productName}-${version}-${arch}.${ext}
   category: Development
+  files:
+    - '!node_modules/node-pty/prebuilds/linux-*/**'
+    - '!node_modules/node-pty/prebuilds/win32-*/**'
   hardenedRuntime: true
   gatekeeperAssess: true
   entitlements: build/entitlements.mac.plist
@@ -64,6 +89,9 @@ linux:
   target:
     - dir
     - AppImage
+  files:
+    - '!node_modules/node-pty/prebuilds/darwin-*/**'
+    - '!node_modules/node-pty/prebuilds/win32-*/**'
   icon: build/icons
   category: Development
   maintainer: Fraktole
@@ -74,8 +102,10 @@ appImage:
   executableArgs: []
 extraResources:
   - src/assets/fonts/**
-# installs the curated AppRun (GTK env sanitization + sandbox probe) over the
+# (Linux only) installs the curated AppRun (GTK env sanitization + sandbox probe) over the
 # generated one; see scripts/after-pack.cjs
 afterPack: scripts/after-pack.cjs
-# node-pty is rebuilt for the bundled Electron ABI at package time
+# node-pty is rebuilt for the bundled Electron ABI at package time (Linux;
+# `pnpm dist:win` passes -c.npmRebuild=false: the win32 N-API prebuilds are
+# used as-is)
 npmRebuild: true

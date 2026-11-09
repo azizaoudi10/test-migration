@@ -114,7 +114,8 @@ describe('session bundle export/import', () => {
 });
 
 describe('bundle hardening', () => {
-  it('rejects archives containing symlink members (tar zip-slip)', async () => {
+  // symlinks need Developer Mode on Windows
+  it.skipIf(process.platform === 'win32')('rejects archives containing symlink members (tar zip-slip)', async () => {
     const root = await mkdtemp(join(tmpdir(), 'frak-evil-'));
     const outRoot = join(root, 'out');
     await mkdir(outRoot, { recursive: true });

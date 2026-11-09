@@ -22,7 +22,9 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-describe('PtyHost process lifecycle (audit D2)', () => {
+// bash/process-group semantics: the Windows (ConPTY + taskkill) path is
+// covered by tests/pty-host-win.test.ts
+describe.skipIf(process.platform === 'win32')('PtyHost process lifecycle (audit D2)', () => {
   it('awaits the SIGKILL escalation for a TERM-ignoring child', async () => {
     const host = makeHost();
     // bash ignores TERM and keeps respawning its sleeping child: only the

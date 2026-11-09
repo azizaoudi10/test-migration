@@ -13,7 +13,10 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
     "build": "pnpm -r build",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "dev": "pnpm --filter @fraktole/desktop dev",
+    "dist:win": "pnpm --filter @fraktole/desktop dist:win",
+    "dist:linux": "pnpm --filter @fraktole/desktop dist:linux"
   },
   "devDependencies": {
     "@eslint/js": "catalog:",

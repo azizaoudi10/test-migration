@@ -1,6 +1,6 @@
 # Fraktole
 
-> **A Linux-native tiling command center for orchestrating autonomous AI coding agents — real PTY tiles, a supervising Reviewer model, and one-click premade loops (Auto Compose).**
+> **A cross-platform (Windows 10/11 + Linux) tiling command center for orchestrating autonomous AI coding agents — real PTY tiles, a supervising Reviewer model, and one-click premade loops (Auto Compose).**
 
 Fraktole pairs terminal multiplexing with a supervising **Reviewer model** that has the role of an autonomous general: it dispatches substantive work to an agent workforce running in live PTY tiles, verifies code and runtime state itself, and manages goals through to completion.
 
@@ -141,6 +141,19 @@ The companion Android application connects securely to your desktop workstation 
 
 ## Download
 
+### Windows
+
+Every version tag (`v*`) also publishes Windows x64 builds:
+
+- `Fraktole-<version>-x64-setup.exe` — installer (per-user by default, no admin rights needed; Start-menu and desktop shortcuts);
+- `Fraktole-<version>-x64-portable.exe` — single executable, nothing installed.
+
+Requirements: **Windows 10 version 1809 or newer** (ConPTY) or Windows 11, x64. Tiles open **PowerShell 7** (`pwsh`) when installed, otherwise Windows PowerShell, otherwise `cmd.exe`; set `FRAKTOLE_SHELL` to force another shell (e.g. `C:\Program Files\Git\bin\bash.exe`). Optional tools: `winget install Git.Git BurntSushi.ripgrep.MSVC` (tar ships with Windows). Unsigned builds show a SmartScreen prompt on first launch (*More info → Run anyway*).
+
+See [MIGRATION-WINDOWS.md](MIGRATION-WINDOWS.md) for what changed in the Windows port.
+
+### Linux
+
 Prebuilt **AppImage** (x86_64, Linux) binaries are published automatically to [GitHub Releases](https://github.com/Zauberman/Fraktole/releases) whenever a version tag (`v*`) is pushed. Download the latest `Fraktole-*.AppImage`, make it executable, and run it — no installation required:
 
 ```bash
@@ -157,12 +170,20 @@ To build the AppImage yourself, see [Build Portable AppImage](#build-portable-ap
 ## Quickstart & Installation
 
 ### Prerequisites
-- **OS**: Linux (x86_64), glibc **>= 2.34** (Ubuntu 22.04+/Debian 12+/Fedora 36+); the AppImage uses the static runtime and needs no separate libfuse package
+- **OS**: Windows 10 1809+/11 (x64), or Linux (x86_64), glibc **>= 2.34** (Ubuntu 22.04+/Debian 12+/Fedora 36+); the AppImage uses the static runtime and needs no separate libfuse package
 - **Node.js**: `>= 22`
 - **pnpm**: `>= 10`
 - Optional: `git` (projects/fork/status), `tar` (session bundles), `rg` (fast search; the JS walk is the fallback)
 
-### Build Self-Contained Installer
+### Build the Windows installer (on Windows)
+```powershell
+git clone <this repository>
+cd Fraktole
+pnpm install            # node-pty uses its N-API win32 prebuilds: no Visual Studio needed
+pnpm dist:win           # → apps/desktop/release/Fraktole-*-x64-setup.exe and *-portable.exe
+```
+
+### Build Self-Contained Installer (Linux)
 ```bash
 # Clone repository
 git clone https://github.com/Zauberman/Fraktole.git
@@ -181,7 +202,7 @@ bash apps/desktop/release/fraktole-install-*.sh
 fraktole-desktop
 ```
 
-### Build Portable AppImage
+### Build Portable AppImage (Linux)
 ```bash
 pnpm appimage
 # The AppImage is generated in apps/desktop/release/

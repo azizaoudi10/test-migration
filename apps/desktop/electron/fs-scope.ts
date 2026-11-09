@@ -1,5 +1,5 @@
 import { lstat, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 
 /**
  * Renderer-supplied paths are untrusted: the renderer process runs web
@@ -15,7 +15,10 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 function normalizeRoot(root: string): string {
   const r = resolve(root);
-  return r.endsWith(sep) && r.length > sep.length ? r.slice(0, -1) : r;
+  // a filesystem root keeps its separator ('/' or 'C:\' — 'C:' alone means
+  // "the current directory on drive C")
+  if (parse(r).root === r) return r;
+  return r.endsWith(sep) ? r.slice(0, -1) : r;
 }
 
 /** realpath of the deepest existing ancestor of `p`, plus the not-yet-existing remainder. */
@@ -37,10 +40,15 @@ async function realPrefix(p: string): Promise<{ real: string; rest: string; veri
   return { real: cur, rest, verified: false };
 }
 
+/** Windows paths are case-insensitive (C:\Proj and c:\proj are one dir). */
+const foldCase = process.platform === 'win32' ? (s: string): string => s.toLowerCase() : (s: string): string => s;
+
 function under(root: string, p: string): boolean {
-  // a registered '/' root covers every absolute path
-  if (root === sep) return true;
-  return p === root || p.startsWith(root + sep);
+  // a registered filesystem root ('/' or 'C:\') covers every path on it
+  if (parse(root).root === root) return foldCase(p).startsWith(foldCase(root));
+  const r = foldCase(root);
+  const q = foldCase(p);
+  return q === r || q.startsWith(r + sep);
 }
 
 /**
@@ -75,8 +83,12 @@ export async function confinePath(roots: string[], target: unknown): Promise<str
 export async function confineNoSymlinks(roots: string[], target: unknown): Promise<string | null> {
   const scoped = await confinePath(roots, target);
   if (scoped === null) return null;
-  const parts = scoped.split(sep).filter((p) => p.length > 0);
-  let cur: string = sep;
+  // start from the path's own root ('/' on POSIX, 'C:\' or '\\srv\share\'
+  // on Windows) — joining a drive letter onto sep would yield '\C:' and skip
+  // the whole check
+  const root = parse(scoped).root;
+  const parts = scoped.slice(root.length).split(sep).filter((p) => p.length > 0);
+  let cur: string = root;
   for (const part of parts) {
     cur = join(cur, part);
     try {

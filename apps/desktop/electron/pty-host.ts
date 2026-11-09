@@ -1,6 +1,7 @@
 import type * as pty from 'node-pty';
 import type { PtyExitPayload } from '../src/shared/ipc.js';
 import { IPC } from '../src/shared/ipc.js';
+import { defaultShell, defaultShellArgs, IS_WINDOWS, killProcessTree, resolvePtyCommand } from './platform.js';
 import { loadPty } from './preflight.js';
 
 export interface PtySession {
@@ -33,10 +34,21 @@ interface PtySessionEntry {
 }
 
 /**
- * One PTY per tile. Children are spawned as session leaders by node-pty, so
- * killing the negative pid kills the shell and its whole process group —
- * agents started inside a tile die with it.
+ * One PTY per tile. On POSIX children are spawned as session leaders by
+ * node-pty, so killing the negative pid kills the shell and its whole
+ * process group; on Windows (ConPTY) the tree is killed with taskkill /T —
+ * either way agents started inside a tile die with it.
  */
+/** Windows: closing the pseudoconsole releases the ConPTY handles (the
+ *  process tree itself is already being torn down by taskkill). */
+function closeConpty(term: pty.IPty): void {
+  try {
+    term.kill();
+  } catch {
+    // already closed
+  }
+}
+
 export class PtyHost {
   private readonly sessions = new Map<string, PtySessionEntry>();
 
@@ -54,19 +66,25 @@ export class PtyHost {
     const ptyMod = loadPty();
     if (!ptyMod) throw new Error('node-pty unavailable');
     // an empty SHELL (common for app-menu/systemd launches) must fall back:
-    // `??` would keep '' and pty.spawn('') fails
-    const shell = process.env.SHELL || '/bin/bash';
-    const term = ptyMod.spawn(opts.command ?? shell, opts.args ?? [], {
+    // defaultShell() never returns '' (pty.spawn('') fails)
+    const shell = defaultShell();
+    const target = opts.command !== undefined
+      ? resolvePtyCommand(opts.command, opts.args ?? [])
+      : { file: shell, args: opts.args ?? defaultShellArgs(shell) };
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      TERM: 'xterm-256color',
+      ...opts.envExt,
+    };
+    // PWD is a POSIX shell convention; Windows shells ignore it
+    if (!IS_WINDOWS) env.PWD = opts.cwd;
+    const term = ptyMod.spawn(target.file, target.args, {
       name: 'xterm-256color',
       cols: Math.max(opts.cols, 2),
       rows: Math.max(opts.rows, 2),
       cwd: opts.cwd,
-      env: {
-        ...process.env,
-        TERM: 'xterm-256color',
-        PWD: opts.cwd,
-        ...opts.envExt,
-      },
+      env,
+      ...(IS_WINDOWS ? { useConpty: true } : {}),
     });
     const entry: PtySessionEntry = { pty: term, cwd: opts.cwd, killTimer: null, exitWaiters: [] };
     term.onData((data) => this.opts.send(IPC.ptyData, tileId, data));
@@ -127,7 +145,8 @@ export class PtyHost {
       entry.killTimer = null;
     }
     try {
-      process.kill(-entry.pty.pid, 'SIGKILL');
+      killProcessTree(entry.pty.pid, 'SIGKILL', true);
+      if (IS_WINDOWS) closeConpty(entry.pty);
     } catch {
       try {
         entry.pty.kill('SIGKILL');
@@ -147,7 +166,8 @@ export class PtyHost {
     const { pty: term } = session;
     const exited = new Promise<void>((resolve) => session.exitWaiters.push(resolve));
     try {
-      process.kill(-term.pid, 'SIGTERM');
+      killProcessTree(term.pid, 'SIGTERM');
+      if (IS_WINDOWS) closeConpty(term);
     } catch {
       try {
         term.kill('SIGTERM');
@@ -160,7 +180,8 @@ export class PtyHost {
       // only escalate while this exact session still owns the tileId
       if (this.sessions.get(tileId) === session) {
         try {
-          process.kill(-term.pid, 'SIGKILL');
+          killProcessTree(term.pid, 'SIGKILL');
+          if (IS_WINDOWS) closeConpty(term);
         } catch {
           try {
             term.kill('SIGKILL');

@@ -27,12 +27,16 @@ export function loadPty(): PtyModule | null {
       | undefined;
     const glibc = report?.header?.glibcVersionRuntime ?? 'unknown';
     const detail = err instanceof Error ? err.message : String(err);
+    const advice =
+      process.platform === 'win32'
+        ? `This build requires Windows 10 version 1809 or newer (ConPTY) and the ` +
+          `Microsoft Visual C++ Redistributable (x64).\n` +
+          `Reinstall Fraktole, or install the latest VC++ Redistributable from Microsoft.\n\n`
+        : `This build requires glibc 2.34 or newer (found: ${glibc}).\n` +
+          `Use Ubuntu 22.04+/Debian 12+/Fedora 36+, or install an older Fraktole build.\n\n`;
     dialog.showErrorBox(
       'Fraktole cannot start',
-      `The bundled terminal module (node-pty) could not be loaded.\n\n` +
-        `This build requires glibc 2.34 or newer (found: ${glibc}).\n` +
-        `Use Ubuntu 22.04+/Debian 12+/Fedora 36+, or install an older Fraktole build.\n\n` +
-        `Details: ${detail}`,
+      `The bundled terminal module (node-pty) could not be loaded.\n\n` + advice + `Details: ${detail}`,
     );
     app.quit();
     return null;

@@ -1,5 +1,5 @@
 import { readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { PROJECT_SKIP_DIRS } from './skip-dirs.js';
 
 /** Quick-open (Ctrl+P): bounded walk of a project root → file list. The
@@ -18,7 +18,7 @@ const quickOpenCache = new Map<string, { at: number; files: Array<{ name: string
  *  must not serve stale palette results). */
 export function invalidateProjectFiles(root: string): void {
   for (const key of [...quickOpenCache.keys()]) {
-    if (key === root || key.startsWith(root.endsWith('/') ? root : `${root}/`)) quickOpenCache.delete(key);
+    if (key === root || key.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) quickOpenCache.delete(key);
   }
 }
 

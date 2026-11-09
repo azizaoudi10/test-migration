@@ -53,8 +53,11 @@ const ID_MATCH_PENALTY = 4; // id hits rank below label hits
 /** Strip the project-root prefix so rows show project-relative paths. */
 function relPath(path: string, root: string | null): string {
   if (root === null) return path;
-  const prefix = root.endsWith('/') ? root : `${root}/`;
-  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+  // Windows roots/paths use '\' — compare and display with '/'
+  const norm = path.replace(/\\/g, '/');
+  const r = root.replace(/\\/g, '/');
+  const prefix = r.endsWith('/') ? r : `${r}/`;
+  return norm.startsWith(prefix) ? norm.slice(prefix.length) : path;
 }
 
 /** Split `dir/base` at the last separator; `dir` keeps its trailing `/`. */

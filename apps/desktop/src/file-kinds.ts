@@ -8,7 +8,7 @@ export type FileKind = 'folder' | 'code' | 'doc' | 'config' | 'style' | 'data' |
 
 const CODE = new Set([
   'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rs', 'go', 'c', 'h', 'cpp', 'hpp',
-  'java', 'kt', 'swift', 'rb', 'php', 'sh', 'bash', 'zsh', 'fish', 'lua', 'dart',
+  'java', 'kt', 'swift', 'rb', 'php', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'psm1', 'bat', 'cmd', 'lua', 'dart',
   'vue', 'svelte', 'zig', 'ex', 'exs', 'erl', 'hs', 'ml', 'scala', 'pl', 'r', 'jl',
 ]);
 const DOC = new Set(['md', 'mdx', 'txt', 'rst', 'adoc', 'pdf', 'org', 'tex']);

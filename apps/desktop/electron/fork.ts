@@ -74,14 +74,14 @@ export async function forkProject(src: string, dest: string, home: string, keepE
   }
 
   const cleanWorktree = await new Promise<boolean>((resolve) => {
-    execFile('git', ['status', '--porcelain'], { cwd: src, timeout: 15_000 }, (err, out) => {
+    execFile('git', ['status', '--porcelain'], { cwd: src, timeout: 15_000, windowsHide: true }, (err, out) => {
       resolve(err === null && out.trim().length === 0);
     });
   });
 
   if (cleanWorktree) {
     const cloned = await new Promise<boolean>((resolve) => {
-      execFile('git', ['clone', '--local', '--quiet', src, dest], { timeout: 120_000 }, (err, _out, stderr) => {
+      execFile('git', ['clone', '--local', '--quiet', src, dest], { timeout: 120_000, windowsHide: true }, (err, _out, stderr) => {
         if (err) console.error(`[fork] git clone failed (${err.message}): ${String(stderr).slice(0, 300)}`);
         resolve(err === null);
       });

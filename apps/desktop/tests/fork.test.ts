@@ -29,7 +29,8 @@ async function gitInit(dir: string, file: string, content: string): Promise<void
 }
 
 describe('forkProject', () => {
-  it('does not leak a symlink pointing outside the project into the fork', async () => {
+  // symlinks need Developer Mode on Windows; fifos do not exist there
+  it.skipIf(process.platform === 'win32')('does not leak a symlink pointing outside the project into the fork', async () => {
     const root = await mkdtemp(join(tmpdir(), 'frak-fork-'));
     const src = join(root, 'src');
     const dest = join(root, 'fork');
@@ -47,7 +48,8 @@ describe('forkProject', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('copies a symlink that stays inside the project (target materialized)', async () => {
+  // symlinks need Developer Mode on Windows; fifos do not exist there
+  it.skipIf(process.platform === 'win32')('copies a symlink that stays inside the project (target materialized)', async () => {
     const root = await mkdtemp(join(tmpdir(), 'frak-fork-'));
     const src = join(root, 'src');
     const dest = join(root, 'fork');
@@ -123,7 +125,8 @@ describe('forkProject', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('skips unreadable files instead of aborting the fork (EACCES)', async () => {
+  // POSIX permission bits: chmod 0o000 is a no-op on Windows
+  it.skipIf(process.platform === 'win32')('skips unreadable files instead of aborting the fork (EACCES)', async () => {
     const root = await mkdtemp(join(tmpdir(), 'frak-fork-'));
     const src = join(root, 'src');
     await mkdir(join(src, 'local-gpu'), { recursive: true });
@@ -138,7 +141,8 @@ describe('forkProject', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('skips an unreadable directory subtree entirely', async () => {
+  // POSIX permission bits: chmod 0o000 is a no-op on Windows
+  it.skipIf(process.platform === 'win32')('skips an unreadable directory subtree entirely', async () => {
     const root = await mkdtemp(join(tmpdir(), 'frak-fork-'));
     const src = join(root, 'src');
     await mkdir(join(src, 'restricted'), { recursive: true });
@@ -153,7 +157,8 @@ describe('forkProject', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('skips broken symlinks and never copies fifos', async () => {
+  // symlinks need Developer Mode on Windows; fifos do not exist there
+  it.skipIf(process.platform === 'win32')('skips broken symlinks and never copies fifos', async () => {
     const root = await mkdtemp(join(tmpdir(), 'frak-fork-'));
     const src = join(root, 'src');
     await mkdir(src, { recursive: true });

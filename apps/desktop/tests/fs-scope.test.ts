@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { confineOrThrow, confinePath } from '../electron/fs-scope.js';
 
 let root = '';
+// Windows only allows symlinks with Developer Mode / admin rights
+let canSymlink = true;
 
 beforeAll(async () => {
   root = join(tmpdir(), `fraktole-scope-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
@@ -12,7 +14,11 @@ beforeAll(async () => {
   await writeFile(join(root, 'proj', 'src', 'a.ts'), 'x');
   await mkdir(join(root, 'outside'), { recursive: true });
   await writeFile(join(root, 'outside', 'secret.txt'), 's');
-  await symlink(join(root, 'outside', 'secret.txt'), join(root, 'proj', 'leak.txt'));
+  try {
+    await symlink(join(root, 'outside', 'secret.txt'), join(root, 'proj', 'leak.txt'));
+  } catch {
+    canSymlink = false;
+  }
   await mkdir(join(root, 'other'), { recursive: true });
 });
 
@@ -46,7 +52,8 @@ describe('fs-scope confinement', () => {
     expect(p).toBe(join(root, 'proj', 'src', 'new-file.ts'));
   });
 
-  it('refuses symlinks that point outside the roots', async () => {
+  it('refuses symlinks that point outside the roots', async (ctx) => {
+    if (!canSymlink) ctx.skip();
     expect(await confinePath([join(root, 'proj')], join(root, 'proj', 'leak.txt'))).toBeNull();
   });
 

@@ -516,7 +516,7 @@ const TOOLS: ReviewerTool[] = [
     },
     async run(args, ctx) {
       const path = typeof args.path === 'string' && args.path.trim().length > 0 ? args.path.trim() : '';
-      const abs = path.startsWith('/') ? path : join(ctx.cwd, path);
+      const abs = isAbsolute(path) ? path : join(ctx.cwd, path);
       const scoped = await confineRead(abs, ctx);
       if (scoped === null) return 'error: path outside the project scope';
       const depth = clampInt(args.depth, 1, 1, 3);
@@ -542,7 +542,7 @@ const TOOLS: ReviewerTool[] = [
       const pattern = typeof args.pattern === 'string' ? args.pattern : '';
       if (pattern.length === 0) return 'error: pattern required';
       const path = typeof args.path === 'string' && args.path.trim().length > 0 ? args.path.trim() : '';
-      const abs = path.startsWith('/') ? path : join(ctx.cwd, path);
+      const abs = isAbsolute(path) ? path : join(ctx.cwd, path);
       const scoped = await confineRead(abs, ctx);
       if (scoped === null) return 'error: path outside the project scope';
       const glob = typeof args.glob === 'string' && args.glob.trim().length > 0 ? args.glob.trim() : undefined;
@@ -645,7 +645,7 @@ const TOOLS: ReviewerTool[] = [
       if (targets.length > 8) return 'error: at most 8 files per call';
       const out: string[] = [];
       for (const path of targets) {
-        const abs = path.startsWith('/') ? path : join(ctx.cwd, path);
+        const abs = isAbsolute(path) ? path : join(ctx.cwd, path);
         const scoped = await confineRead(abs, ctx);
         if (scoped === null) {
           out.push(`=== ${path} ===\nerror: path outside the project scope`);

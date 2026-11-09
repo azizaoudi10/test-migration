@@ -222,7 +222,7 @@ export function useFileEditor(options: FileEditorOptions = {}): FileEditorState 
       const readOnly = st.size > MAX_EDITABLE;
       // a file too large to edit must not be read into memory at all
       const { content } = readOnly ? { content: '' } : await bridge.readFile(path);
-      const name = path.split('/').pop() ?? path;
+      const name = path.split(/[\\/]/).pop() ?? path;
       const draft = !readOnly ? readDraft(path) : null;
       if (readOnly) {
         onNoticeRef.current?.(`${name} is too large to edit (${Math.round(st.size / 1024)} KB) — opened read-only`);
@@ -382,7 +382,7 @@ export function useFileEditor(options: FileEditorOptions = {}): FileEditorState 
       prev.map((f) => {
         if (f.path !== from && !f.path.startsWith(`${from}/`)) return f;
         const path = remap(f.path);
-        return { ...f, path, name: path.split('/').pop() ?? path };
+        return { ...f, path, name: path.split(/[\\/]/).pop() ?? path };
       }),
     );
     setActivePath((active) => (active !== null && (active === from || active.startsWith(`${from}/`)) ? remap(active) : active));

@@ -8,6 +8,7 @@ import { MailboxRouter, ORCHESTRATOR_ID, messageId } from './mailbox.js';
 import { readMessagesJsonl } from './messages-log.js';
 import { listProjectFiles, invalidateProjectFiles } from './project-files.js';
 import { listModels } from './model-list.js';
+import { defaultShell, installHint, IS_WINDOWS, LINE_END, tarBinary } from './platform.js';
 import { loadPty } from './preflight.js';
 import { PtyHost } from './pty-host.js';
 import { ProjectsStore } from './projects.js';
@@ -202,7 +203,7 @@ function warnMissingOptionalTools(win: BrowserWindow): void {
   const missing: string[] = [];
   for (const tool of ['git', 'tar']) {
     try {
-      execFileSync(tool, ['--version'], { stdio: 'ignore' });
+      execFileSync(tool === 'tar' ? tarBinary() : tool, ['--version'], { stdio: 'ignore', windowsHide: true });
     } catch {
       missing.push(tool);
     }
@@ -214,7 +215,7 @@ function warnMissingOptionalTools(win: BrowserWindow): void {
     message: `${missing.join(' and ')} not found on PATH`,
     detail:
       'Project detection, git status, auto-compose forks and session bundles need these tools. ' +
-      'Install them (e.g. apt install git tar) and restart Fraktole.',
+      installHint(missing),
     buttons: ['OK'],
   });
 }
@@ -238,7 +239,7 @@ function createWindow(): void {
     backgroundColor: '#171a20',
     show: false,
     title: 'Fraktole',
-    icon: join(__dirname, '..', 'build', 'icon.png'),
+    icon: join(__dirname, '..', 'build', IS_WINDOWS ? 'icon.ico' : 'icon.png'),
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
@@ -280,6 +281,10 @@ function createWindow(): void {
   })();
 }
 
+// Windows toast notifications are attributed (and only shown) through the
+// AppUserModelID — it must match the installer's appId
+if (IS_WINDOWS) app.setAppUserModelId('com.fraktole.desktop');
+
 if (!app.requestSingleInstanceLock()) {
   // a second launch (app menu, desktop entry, repeated command) while an
   // instance is already running: quit silently — the first instance is
@@ -299,7 +304,8 @@ if (!app.requestSingleInstanceLock()) {
   // the launcher sends this instead of spawning a doomed second Electron
   // (whose zygotes would leak as orphans); some args-bearing launches still
   // fall through to the second-instance event above
-  process.on('SIGUSR2', focusApp);
+  // (POSIX only: Windows has no SIGUSR2 — second-instance covers it there)
+  if (!IS_WINDOWS) process.on('SIGUSR2', focusApp);
 
   app.whenReady().then(async () => {
     // native addon preflight: on an old glibc this shows an actionable dialog
@@ -577,7 +583,7 @@ if (!app.requestSingleInstanceLock()) {
               // a persisted-but-dead agent has no PTY: report failure instead
               // of claiming a launch that went nowhere (audit RV-10)
               if (!host.has(tileId)) return Promise.resolve(`error: agent ${agentId} is not running`);
-              host.write(tileId, opts?.raw === true ? command : `${command}\n`);
+              host.write(tileId, opts?.raw === true ? command : `${command}${LINE_END}`);
               return Promise.resolve(`launched "${command}" in ${agentId}`);
             },
             // Terminal-input tools may only target a harness tile; a bare shell
@@ -789,7 +795,7 @@ if (!app.requestSingleInstanceLock()) {
 
     ipcMain.handle(IPC.appInfo, (): AppInfo => ({
       version: app.getVersion(),
-      shell: process.env.SHELL || '/bin/bash',
+      shell: defaultShell(),
       userData: app.getPath('userData'),
       home,
     }));
@@ -897,7 +903,7 @@ ipcMain.handle(IPC.ptySpawn, async (_e, args: PtySpawnArgs): Promise<PtySpawnRes
     rt.host.spawn(args.tileId, { cwd: args.cwd, cols: args.cols, rows: args.rows, envExt: env });
     sessionInfra.get(session.id)?.recorder.resize(args.tileId, args.cols, args.rows);
     if (args.command && args.command.trim().length > 0) {
-      rt.host.write(args.tileId, `${args.command.trim()}\n`);
+      rt.host.write(args.tileId, `${args.command.trim()}${LINE_END}`);
     }
     // the PTY is genuinely alive now — the reviewer's spawn verdict is real
     settlePendingSpawn(args.sessionId, agentId, `spawned agent ${agentId} (tile ${args.tileId})`);

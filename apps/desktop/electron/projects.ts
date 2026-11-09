@@ -82,8 +82,10 @@ export class ProjectsStore {
   }
 
   private async gitTopLevel(path: string): Promise<string> {
-    const { stdout } = await execFileP('git', ['rev-parse', '--show-toplevel'], { cwd: path });
+    const { stdout } = await execFileP('git', ['rev-parse', '--show-toplevel'], { cwd: path, windowsHide: true });
     const top = stdout.trim();
-    return top.length > 0 ? top : resolve(path);
+    // git prints forward slashes on Windows (C:/Users/…): resolve() turns it
+    // into the native form so it compares equal to dialog/fs paths
+    return top.length > 0 ? resolve(top) : resolve(path);
   }
 }
