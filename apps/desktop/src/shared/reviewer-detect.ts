@@ -1,0 +1,220 @@
+/** Provider resolution for the reviewer harness. The manual provider pick
+ *  (provider-catalog.ts) drives resolution when one is set — "dropdown wins".
+ *  When no provider was chosen, fall back to key-prefix auto-detection from a
+ *  single API key. Pure module — imported by both the main process
+ *  (ReviewerHost) and the renderer (config form), so the badge shown while
+ *  typing always matches what the harness will use.
+ *
+ *  Key prefixes (fallback path only):
+ *    sk-ant-*            → Anthropic (unambiguous)
+ *    sk-proj-* and sk-svcacct-* → OpenAI (unambiguous)
+ *    sk-*                → ambiguous (OpenAI vs DeepSeek vs compatible
+ *                          endpoints) — resolved by baseUrl hints or the
+ *                          user's dropdown pick; defaults to OpenAI
+ *    empty               → Ollama (local, keyless)
+ *    anything else       → usable only with a custom baseUrl
+ */
+import { CUSTOM_PROVIDER_ID, getProvider, type ProviderCatalogEntry } from './provider-catalog.js';
+export type DetectedProvider = 'anthropic' | 'openai' | 'deepseek' | 'ollama';
+
+export interface ProviderResolution {
+  /** Which ProviderClient adapter to build. */
+  adapter: 'anthropic' | 'openai' | 'ollama';
+  model: string;
+  baseUrl: string;
+  /** True when the key alone cannot identify the provider and no hint
+   *  resolves it — the config form must ask the user. */
+  ambiguous: boolean;
+}
+
+export const DEFAULT_MODELS: Record<DetectedProvider, string> = {
+  anthropic: 'claude-sonnet-4-5',
+  openai: 'gpt-4o',
+  deepseek: 'deepseek-v4-flash',
+  ollama: 'qwen2.5',
+};
+
+export const BASE_URLS: Record<'anthropic' | 'openai' | 'deepseek', string> = {
+  anthropic: 'https://api.anthropic.com',
+  openai: 'https://api.openai.com/v1',
+  deepseek: 'https://api.deepseek.com/v1',
+};
+
+/** Model suggestions per detected provider (the user picks; free text ok).
+ *  The config form also fetches the live model list from the API
+ *  (electron/model-list.ts) and prefers it — these are the offline fallback. */
+export const REVIEWER_MODEL_SUGGESTIONS: Record<DetectedProvider, string[]> = {
+  anthropic: ['claude-sonnet-4-5', 'claude-opus-4-1', 'claude-haiku-4-5', 'claude-3-7-sonnet-latest'],
+  openai: ['gpt-4o', 'gpt-5', 'gpt-5-mini', 'o4-mini'],
+  deepseek: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'],
+  ollama: ['qwen2.5', 'llama3.2', 'qwen3', 'mistral'],
+};
+
+export interface ResolveOpts {
+  /** Custom OpenAI-compatible endpoint (also the DeepSeek hint). */
+  baseUrl?: string;
+  /** The user's explicit provider pick (dropdown, ambiguous keys only). */
+  providerHint?: string;
+  /** The user's model pick (overrides the per-provider default). */
+  modelHint?: string;
+}
+
+export function resolveProvider(key: string, opts: ResolveOpts = {}): ProviderResolution {
+  const k = key.trim();
+  if (k.length === 0) {
+    return {
+      adapter: 'ollama',
+      model: opts.modelHint ?? DEFAULT_MODELS.ollama,
+      // a configured endpoint must win: keyless resolution is not
+      // hard-wired to localhost (remote/self-hosted ollama works)
+      baseUrl: opts.baseUrl ?? 'http://localhost:11434',
+      ambiguous: false,
+    };
+  }
+  if (k.startsWith('sk-ant-')) {
+    return {
+      adapter: 'anthropic',
+      model: opts.modelHint ?? DEFAULT_MODELS.anthropic,
+      baseUrl: opts.baseUrl ?? BASE_URLS.anthropic,
+      ambiguous: false,
+    };
+  }
+  if (k.startsWith('sk-proj-') || k.startsWith('sk-svcacct-')) {
+    return {
+      adapter: 'openai',
+      model: opts.modelHint ?? DEFAULT_MODELS.openai,
+      baseUrl: opts.baseUrl ?? BASE_URLS.openai,
+      ambiguous: false,
+    };
+  }
+  if (k.startsWith('sk-')) {
+    if (opts.baseUrl?.toLowerCase().includes('deepseek') || opts.providerHint === 'deepseek') {
+      return {
+        adapter: 'openai',
+        model: opts.modelHint ?? DEFAULT_MODELS.deepseek,
+        baseUrl: opts.baseUrl ?? BASE_URLS.deepseek,
+        ambiguous: false,
+      };
+    }
+    if (opts.providerHint === 'openai' || (opts.baseUrl && opts.baseUrl.length > 0)) {
+      // a custom baseUrl that is clearly an ollama-native endpoint (the
+      // /api/chat surface, or the default ollama port without a /v1 path)
+      // must use the ollama wire format — not the openai one
+      if (!opts.providerHint && isOllamaNative(opts.baseUrl!)) {
+        return {
+          adapter: 'ollama',
+          model: opts.modelHint ?? DEFAULT_MODELS.ollama,
+          baseUrl: opts.baseUrl!,
+          ambiguous: false,
+        };
+      }
+      return {
+        adapter: 'openai',
+        model: opts.modelHint ?? DEFAULT_MODELS.openai,
+        baseUrl: opts.baseUrl ?? BASE_URLS.openai,
+        ambiguous: false,
+      };
+    }
+    return {
+      adapter: 'openai',
+      model: opts.modelHint ?? DEFAULT_MODELS.openai,
+      baseUrl: BASE_URLS.openai,
+      ambiguous: true,
+    };
+  }
+  // unknown prefix: only usable with a custom baseUrl
+  return {
+    adapter: 'openai',
+    model: opts.modelHint ?? DEFAULT_MODELS.openai,
+    baseUrl: opts.baseUrl ?? BASE_URLS.openai,
+    ambiguous: !opts.baseUrl,
+  };
+}
+
+/** Ollama-native endpoints speak /api/chat, not the OpenAI-compatible
+ *  /v1/chat/completions surface — the wire format must match. */
+function isOllamaNative(baseUrl: string): boolean {
+  const u = baseUrl.toLowerCase();
+  return u.includes('/api/chat') || (u.includes(':11434') && !u.includes('/v1'));
+}
+
+/** The reviewer config as the harness + form see it (a slim slice of
+ *  Settings['reviewer']). Both the main process and the renderer use this. */
+export interface ReviewerConfigInput {
+  apiKey?: string;
+  apiKeyEnv?: string;
+  /** The manual provider id (provider-catalog.ts) — wins when set. */
+  providerId?: string;
+  /** Legacy provider hint (ambiguous sk- keys); superseded by providerId. */
+  provider?: 'openai' | 'anthropic' | 'ollama' | 'deepseek';
+  model?: string;
+  baseUrl?: string;
+}
+
+/** A resolution plus the catalog entry that produced it (for the UI to know
+ *  whether a key is required, show a keyHint, etc.). */
+export interface ConfigResolution extends ProviderResolution {
+  /** The catalog entry when a manual provider was picked. */
+  entry?: ProviderCatalogEntry;
+  /** True when resolution came from the explicit provider pick. */
+  manual: boolean;
+  /** True when NOTHING is configured (no key, no pick, no endpoint, no
+   *  model) — the first-run signal: the harness must NOT silently target
+   *  the localhost ollama port; it asks the user to pick a provider. */
+  empty?: boolean;
+}
+
+/**
+ *  Resolve the effective provider/adapter/baseUrl/model for the reviewer.
+ *
+ *  Precedence ("dropdown wins, both run"):
+ *    1. A set providerId that resolves in the catalog — its adapter, baseUrl
+ *       and default model win; a cfg baseUrl/model still override the entry.
+ *    2. Otherwise fall back to key-prefix auto-detection (resolveProvider),
+ *       preserving legacy behavior.
+ */
+export function resolveReviewerConfig(cfg: ReviewerConfigInput = {}): ConfigResolution {
+  const entry = getProvider(cfg.providerId);
+  if (entry) {
+    // custom entries ship an empty baseUrl by design — falling through to
+    // key-prefix detection would silently target localhost:11434 with the
+    // OpenAI wire format (audit RV-29); flag it empty so the harness asks
+    const explicit = cfg.baseUrl?.trim() || entry.baseUrl;
+    const baseUrl = explicit || (entry.id === CUSTOM_PROVIDER_ID ? '' : resolveProvider(cfg.apiKey ?? '', {}).baseUrl);
+    const model = cfg.model?.trim() || entry.defaultModel;
+    return {
+      adapter: entry.adapter,
+      model: model || DEFAULT_MODELS.openai,
+      baseUrl,
+      ambiguous: false,
+      entry,
+      manual: true,
+      ...(entry.id === CUSTOM_PROVIDER_ID && baseUrl.length === 0 ? { empty: true } : {}),
+    };
+  }
+  // literally nothing configured (fresh install): falling through to the
+  // keyless ollama default would silently talk to localhost:11434 with a
+  // qwen2.5 the user never chose — flag it and let the harness ask instead
+  const nothingConfigured =
+    !cfg.apiKey?.trim() &&
+    !cfg.apiKeyEnv &&
+    !cfg.baseUrl &&
+    !cfg.model &&
+    !cfg.provider;
+  if (nothingConfigured) {
+    return {
+      adapter: 'ollama',
+      model: DEFAULT_MODELS.ollama,
+      baseUrl: 'http://localhost:11434',
+      ambiguous: false,
+      manual: false,
+      empty: true,
+    };
+  }
+  const res = resolveProvider(cfg.apiKey ?? '', {
+    baseUrl: cfg.baseUrl,
+    providerHint: cfg.provider,
+    modelHint: cfg.model,
+  });
+  return { ...res, manual: false };
+}

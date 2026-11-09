@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Fraktole AppRun — the AppImage entry point.
+#
+# electron-builder generates an AppRun script for the AppImage; this file is
+# copied over it by scripts/after-pack.cjs. It keeps the generated script's
+# AppDir discovery and library-path wiring, then adds the two fixes the
+# generated script lacks for Fraktole:
+#
+#   1. GTK module sanitization. Electron 36 dlopens both libgtk-3 and
+#      libgtk-4; desktop sessions inject GTK3 modules (xapp-gtk3-module,
+#      gail, ibus im-module) through GTK_MODULES / GTK3_MODULES /
+#      GTK_IM_MODULE / GTK_PATH, which aborts the GTK4 load. The same fix
+#      lives in scripts/launcher.sh for the installer path.
+#   2. Sandbox probe: the generated script already does this, replicated
+#      here so a full replacement stays self-sufficient. `unshare -Ur true`
+#      detects AppArmor-restricted unprivileged user namespaces
+#      (Ubuntu 23.10+/24.04); without them Electron must run --no-sandbox.
+set -e
+
+THIS="$0"
+# shellcheck disable=SC2124
+args=("$@")
+
+if [ -z "$APPDIR" ]; then
+  path="$(dirname "$(readlink -f "$THIS")")"
+  while [ -n "$path" ] && [ ! -e "$path/AppRun" ]; do path="${path%/*}"; done
+  APPDIR="$path"
+fi
+
+if [ -z "$APPDIR" ]; then
+  echo "fraktole: could not locate the AppDir (run this from within the AppImage)" >&2
+  exit 1
+fi
+
+export PATH="$APPDIR:$APPDIR/usr/sbin${PATH:+:$PATH}"
+export XDG_DATA_DIRS="$APPDIR/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}:/usr/share/gnome:/usr/local/share/:/usr/share/"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GSETTINGS_SCHEMA_DIR="$APPDIR/usr/share/glib-2.0/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+
+# GTK3 modules injected by the desktop session must never reach Electron's
+# GTK4 dlopen. XDG_CURRENT_DESKTOP is dropped for the same reason.
+unset GTK_MODULES GTK3_MODULES GTK4_MODULES GTK_IM_MODULE GTK_PATH XDG_CURRENT_DESKTOP
+
+BIN="$APPDIR/fraktole-desktop"
+if [ ! -x "$BIN" ]; then
+  echo "fraktole: missing executable $BIN" >&2
+  exit 1
+fi
+
+HAVE_NO_SANDBOX=0
+for arg in "${args[@]}"; do
+  if [ "$arg" = "--no-sandbox" ]; then
+    HAVE_NO_SANDBOX=1
+    break
+  fi
+done
+NO_SANDBOX=()
+if [ "$HAVE_NO_SANDBOX" -eq 0 ]; then
+  # command -v guards minimal systems without unshare (exit 127 → no sandbox)
+  if ! command -v unshare >/dev/null 2>&1 || ! unshare -Ur true 2>/dev/null; then
+    NO_SANDBOX=(--no-sandbox)
+  fi
+fi
+
+exec "$BIN" "${NO_SANDBOX[@]}" "${args[@]}"

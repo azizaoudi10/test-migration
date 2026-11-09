@@ -1,0 +1,180 @@
+import React, { useEffect, useId, useMemo, useReducer, useRef } from 'react';
+import { selectInit, selectReduce, type SelectAction, type SelectOption, type SelectState } from '../select-nav.js';
+import { AnchoredPopover } from './AnchoredPopover.js';
+
+export type { SelectOption };
+
+interface SelectProps {
+  value: string;
+  options: SelectOption[];
+  onChange(value: string): void;
+  ariaLabel: string;
+  placeholder?: string;
+}
+
+interface Section {
+  label: string | null;
+  items: Array<{ option: SelectOption; index: number }>;
+}
+
+/** Groups flat options into sections in first-appearance order. */
+function groupOptions(options: SelectOption[]): Section[] {
+  const sections: Section[] = [];
+  const byLabel = new Map<string, Section>();
+  options.forEach((option, index) => {
+    const key = option.section ?? '';
+    let sec = byLabel.get(key);
+    if (sec === undefined) {
+      sec = { label: option.section ?? null, items: [] };
+      byLabel.set(key, sec);
+      sections.push(sec);
+    }
+    sec.items.push({ option, index });
+  });
+  return sections;
+}
+
+/** The bespoke listbox that replaces native <select>: trigger + popover,
+ *  keyboard-first (arrows wrap, Home/End, typeahead, Enter commits,
+ *  Escape cancels), ARIA listbox/option roles, section headers. */
+export function Select(props: SelectProps): React.JSX.Element {
+  const { value, options, onChange, ariaLabel, placeholder } = props;
+  // the reducer needs the current options for wrap/typeahead; a ref keeps
+  // dispatch identity stable while always reading fresh options
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  const [state, dispatch] = useReducer(
+    (s: SelectState, a: SelectAction) => selectReduce(s, a, optionsRef.current),
+    selectInit,
+  );
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const activeRef = useRef<HTMLButtonElement | null>(null);
+  // stable per-instance id namespace for aria-activedescendant
+  const idBase = useId();
+
+  const selected = options.find((o) => o.value === value);
+  const sections = useMemo(() => groupOptions(options), [options]);
+
+  useEffect(() => {
+    if (state.open) activeRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [state.open, state.active]);
+
+  const commit = (index: number): void => {
+    const opt = options[index];
+    if (opt === undefined) return;
+    onChange(opt.value);
+    dispatch({ t: 'commit' });
+  };
+
+  /** Opens the listbox on the current selection instead of index 0
+   *  (audit REN-30). */
+  const openList = (): void => {
+    dispatch({ t: 'open' });
+    const idx = options.findIndex((o) => o.value === value);
+    if (idx >= 0) dispatch({ t: 'setIndex', i: idx });
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent): void => {
+    if (!state.open) {
+      if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openList();
+      }
+      return;
+    }
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        dispatch({ t: 'move', d: 1 });
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        dispatch({ t: 'move', d: -1 });
+        break;
+      case 'Home':
+        e.preventDefault();
+        dispatch({ t: 'home' });
+        break;
+      case 'End':
+        e.preventDefault();
+        dispatch({ t: 'end' });
+        break;
+      case 'Enter':
+        e.preventDefault();
+        commit(state.active);
+        break;
+      case 'Escape':
+        e.preventDefault();
+        dispatch({ t: 'close' });
+        break;
+      case 'Tab':
+        // Tab leaves the listbox — close it rather than stranding focus
+        dispatch({ t: 'close' });
+        break;
+      default:
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          dispatch({ t: 'type', ch: e.key, now: Date.now() });
+        }
+    }
+  };
+
+  return (
+    <div className="select" ref={rootRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="select-trigger"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={state.open}
+        onClick={() => (state.open ? dispatch({ t: 'close' }) : openList())}
+        onKeyDown={onKeyDown}
+      >
+        <span className={selected === undefined ? 'select-placeholder' : 'select-value'}>
+          {selected?.label ?? placeholder ?? 'select…'}
+        </span>
+        <span className="select-caret" aria-hidden="true">
+          ▾
+        </span>
+      </button>
+      {state.open && (
+        <AnchoredPopover
+          className="select-pop"
+          role="listbox"
+          ariaLabel={ariaLabel}
+          ariaActiveDescendant={`${idBase}-opt-${state.active}`}
+          anchorEl={triggerRef.current}
+          matchWidth
+          onClose={() => dispatch({ t: 'close' })}
+        >
+          {sections.map((sec) => (
+            <div key={sec.label ?? '__ungrouped'} className="select-section">
+              {sec.label !== null && <div className="select-section-label">{sec.label}</div>}
+              {sec.items.map(({ option, index }) => (
+                <button
+                  key={option.value}
+                  ref={index === state.active ? activeRef : undefined}
+                  type="button"
+                  id={`${idBase}-opt-${index}`}
+                  role="option"
+                  aria-selected={option.value === value}
+                  className={`select-option${index === state.active ? ' select-option-active' : ''}`}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    commit(index);
+                  }}
+                  onMouseMove={() => dispatch({ t: 'setIndex', i: index })}
+                >
+                  <span className="select-option-label">{option.label}</span>
+                  {option.hint !== undefined && <span className="select-option-hint">{option.hint}</span>}
+                </button>
+              ))}
+            </div>
+          ))}
+        </AnchoredPopover>
+      )}
+    </div>
+  );
+}

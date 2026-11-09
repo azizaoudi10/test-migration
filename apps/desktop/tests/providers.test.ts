@@ -1,0 +1,1152 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AnthropicProvider } from '../electron/reviewer/providers/anthropic.js';
+import { OllamaProvider } from '../electron/reviewer/providers/ollama.js';
+import { OpenAIProvider } from '../electron/reviewer/providers/openai.js';
+import { createProvider, parseRetryAfterMs, ProviderHttpError, RETRY_AFTER_CAP_MS } from '../electron/reviewer/providers.js';
+
+function sseStream(lines: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const body = lines.map((l) => encoder.encode(`data: ${l}\n\n`));
+  return new ReadableStream({
+    start(controller) {
+      for (const b of body) controller.enqueue(b);
+      controller.close();
+    },
+  });
+}
+
+function ndjsonStream(lines: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const body = lines.map((l) => encoder.encode(`${l}\n`));
+  return new ReadableStream({
+    start(controller) {
+      for (const b of body) controller.enqueue(b);
+      controller.close();
+    },
+  });
+}
+
+function stubFetch(body: ReadableStream<Uint8Array> | Response, status = 200): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => (body instanceof Response ? body : new Response(body, { status }))),
+  );
+}
+
+const abort = new AbortController().signal;
+
+function baseOpts() {
+  return {
+    model: 'test-model',
+    apiKey: 'k',
+    baseUrl: '',
+    messages: [],
+    tools: [{ name: 'read_scrollback', description: 'read', inputSchema: { type: 'object', properties: {} } }],
+    signal: abort,
+    onDelta: () => undefined,
+  };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('createProvider', () => {
+  it('returns the three known adapters and rejects unknown names', () => {
+    expect(createProvider('openai')).toBeInstanceOf(OpenAIProvider);
+    expect(createProvider('anthropic')).toBeInstanceOf(AnthropicProvider);
+    expect(createProvider('ollama')).toBeInstanceOf(OllamaProvider);
+    expect(() => createProvider('x')).toThrow('unknown reviewer provider');
+  });
+
+  it('parses Retry-After: seconds, HTTP-dates, junk, and the 120s cap', () => {
+    expect(parseRetryAfterMs('7')).toBe(7000);
+    expect(parseRetryAfterMs('0.5')).toBe(500);
+    expect(parseRetryAfterMs('0')).toBe(0);
+    const future = new Date(Date.now() + 10_000).toUTCString();
+    const parsed = parseRetryAfterMs(future);
+    expect(parsed).toBeGreaterThan(8000);
+    expect(parsed).toBeLessThanOrEqual(10_000);
+    const past = new Date(Date.now() - 10_000).toUTCString();
+    expect(parseRetryAfterMs(past)).toBe(0);
+    expect(parseRetryAfterMs('soon')).toBeUndefined();
+    expect(parseRetryAfterMs(null)).toBeUndefined();
+    expect(parseRetryAfterMs('9999')).toBe(RETRY_AFTER_CAP_MS);
+  });
+
+  it('keeps the ProviderHttpError message shape the harness classification expects', () => {
+    const e = new ProviderHttpError('openai', 429, 7000, 'rate limited');
+    expect(e.message).toBe('openai API error 429: rate limited');
+    expect(e.status).toBe(429);
+    expect(e.retryAfterMs).toBe(7000);
+    expect(e).toBeInstanceOf(Error);
+  });
+
+  it('surfaces typed status + Retry-After from each adapter', async () => {
+    stubFetch(new Response('rate limited', { status: 429, headers: { 'retry-after': '7' } }));
+    await expect(new OpenAIProvider().complete(baseOpts())).rejects.toMatchObject({ status: 429, retryAfterMs: 7000 });
+
+    stubFetch(new Response('slow down', { status: 429 }));
+    await expect(new AnthropicProvider().complete(baseOpts())).rejects.toMatchObject({ status: 429, retryAfterMs: undefined });
+
+    stubFetch(new Response('busy', { status: 503, headers: { 'retry-after': '0.5' } }));
+    await expect(new OllamaProvider().complete(baseOpts())).rejects.toMatchObject({ status: 503, retryAfterMs: 500 });
+  });
+});
+
+describe('OpenAIProvider', () => {
+  it('streams a plain text reply', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"hel"}}]}', '{"choices":[{"delta":{"content":"lo"}}]}', '[DONE]']));
+    const deltas: string[] = [];
+    const res = await new OpenAIProvider().complete({ ...baseOpts(), onDelta: (d) => deltas.push(d) });
+    expect(res.text).toBe('hello');
+    expect(res.toolCalls).toEqual([]);
+    expect(deltas).toEqual(['hel', 'lo']);
+  });
+
+  it('accumulates a tool call split across many deltas', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_scrollback","arguments":"{\\"agentId\\":"}}]}}]}',
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"tile-1\\","}}]}}]}',
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"tail\\":5}"}}]}}]}',
+        '{"choices":[{"delta":{"content":"ok"}}]}',
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.text).toBe('ok');
+    expect(res.toolCalls).toEqual([
+      { id: 'c1', name: 'read_scrollback', args: { agentId: 'tile-1', tail: 5 } },
+    ]);
+  });
+
+  it('keeps full arguments when a fragment is independently-valid JSON (deepseek token-boundary split)', async () => {
+    // the exact split captured from api.deepseek.com: numbers and literals
+    // stream as their own delta (`2`, `20`, `true`) — a fragment that is
+    // valid JSON alone must never replace the accumulated prefix
+    const frags = ['{', '"', 'path', '"', ': ', '"', 'front', 'end', '/src', '"', ', ', '"', 'depth', '"', ': ', '2', '}'];
+    stubFetch(
+      sseStream([
+        ...frags.map((f, i) =>
+          JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    i === 0
+                      ? { index: 0, id: 'c1', function: { name: 'list_dir', arguments: f } }
+                      : { index: 0, function: { arguments: f } },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.toolCalls).toEqual([{ id: 'c1', name: 'list_dir', args: { path: 'frontend/src', depth: 2 } }]);
+  });
+
+  it('keeps the prefix across multiple calls when number fragments stream standalone', async () => {
+    const listFrags = ['{', '"', 'path', '"', ': ', '"', 'frontend', '"', ', ', '"', 'depth', '"', ': ', '2', '}'];
+    const killFrags = ['{', '"', 'agentId', '"', ': ', '"', 'agent', '-', '1', '"', '}'];
+    const lines: string[] = [];
+    listFrags.forEach((f, i) =>
+      lines.push(
+        JSON.stringify({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  i === 0
+                    ? { index: 0, id: 'c1', function: { name: 'list_dir', arguments: f } }
+                    : { index: 0, function: { arguments: f } },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    killFrags.forEach((f, i) =>
+      lines.push(
+        JSON.stringify({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  i === 0
+                    ? { index: 1, id: 'c2', function: { name: 'kill_agent', arguments: f } }
+                    : { index: 1, function: { arguments: f } },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    lines.push('[DONE]');
+    stubFetch(sseStream(lines));
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.toolCalls).toEqual([
+      { id: 'c1', name: 'list_dir', args: { path: 'frontend', depth: 2 } },
+      { id: 'c2', name: 'kill_agent', args: { agentId: 'agent-1' } },
+    ]);
+  });
+
+  it('still tolerates providers that re-send the full payload per delta (post-hoc fallback)', async () => {
+    const full = '{"agentId":"tile-1","tail":5}';
+    stubFetch(
+      sseStream([
+        JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'read_scrollback', arguments: full } }] } }] }),
+        JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: full } }] } }] }),
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    // accumulated `{a}{a}` does not parse — the last fragment alone is the payload
+    expect(res.toolCalls).toEqual([{ id: 'c1', name: 'read_scrollback', args: { agentId: 'tile-1', tail: 5 } }]);
+  });
+
+  it('marks genuinely corrupt accumulated arguments as _raw', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_scrollback","arguments":"2}"}}]}}]}',
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.toolCalls).toEqual([{ id: 'c1', name: 'read_scrollback', args: { _raw: '2}' } }]);
+  });
+
+  it('reports API errors', async () => {
+    stubFetch(new Response('nope', { status: 401 }), 401);
+    await expect(new OpenAIProvider().complete(baseOpts())).rejects.toThrow('openai API error 401');
+  });
+
+  it('captures reasoning_content deltas and streams them as thinking', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"reasoning_content":"let me think "}}]}',
+        '{"choices":[{"delta":{"reasoning_content":"about the tiles"}}]}',
+        '{"choices":[{"delta":{"content":"the answer"}}]}',
+        '[DONE]',
+      ]),
+    );
+    const events: Array<[string, string | undefined]> = [];
+    const res = await new OpenAIProvider().complete({
+      ...baseOpts(),
+      onDelta: (d, t) => events.push([d, t]),
+    });
+    expect(res.thinking).toBe('let me think about the tiles');
+    expect(res.text).toBe('the answer');
+    expect(events).toEqual([
+      ['', 'let me think '],
+      ['', 'about the tiles'],
+      ['the answer', undefined],
+    ]);
+  });
+
+  it('accepts the other reasoning field names (reasoning/thinking/thinking_content)', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"thinking":"pondering "}}]}',
+        '{"choices":[{"delta":{"reasoning":"more "}}]}',
+        '{"choices":[{"delta":{"thinking_content":"even more"}}]}',
+        '{"choices":[{"delta":{"content":"done"}}]}',
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.thinking).toBe('pondering more even more');
+  });
+
+  it('captures reasoning sent on the final chunk (choice.message.reasoning_content)', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"content":"x"}}]}',
+        '{"choices":[{"delta":{},"message":{"reasoning_content":"final reasoning"}}]}',
+        '{"choices":[{"delta":{},"message":{"reasoning_content":"final reasoning"}}]}',
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.thinking).toBe('final reasoning'); // deduped
+  });
+
+  it('captures reasoning on a final chunk with no delta at all', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"content":"a"}}]}',
+        '{"choices":[{"message":{"reasoning_content":"qwen-style final reasoning"}}]}',
+        '[DONE]',
+      ]),
+    );
+    const events: Array<[string, string | undefined]> = [];
+    const res = await new OpenAIProvider().complete({
+      ...baseOpts(),
+      onDelta: (d, t) => events.push([d, t]),
+    });
+    expect(res.thinking).toBe('qwen-style final reasoning');
+    expect(res.text).toBe('a');
+    expect(events).toContainEqual(['', 'qwen-style final reasoning']);
+  });
+
+  it('sends reasoning_effort only when set', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"x"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({ ...baseOpts(), reasoningEffort: 'high' });
+    const body1 = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { reasoning_effort?: string };
+    expect(body1.reasoning_effort).toBe('high');
+
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"y"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete(baseOpts());
+    const body2 = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { reasoning_effort?: string };
+    expect(body2.reasoning_effort).toBeUndefined();
+  });
+
+  it('applies the standard sampler knobs (max_tokens, temperature, top_p, seed, penalties)', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"x"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      knobs: { maxOutputTokens: 1024, temperature: 0.4, topP: 0.9, seed: 7, presencePenalty: 0.5, frequencyPenalty: -0.5 },
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect(body.max_tokens).toBe(1024);
+    expect(body.temperature).toBe(0.4);
+    expect(body.top_p).toBe(0.9);
+    expect(body.seed).toBe(7);
+    expect(body.presence_penalty).toBe(0.5);
+    expect(body.frequency_penalty).toBe(-0.5);
+  });
+
+  it('never sends ollama-only knob fields (top_k/min_p/repeat_penalty/keep_alive/think/options)', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"x"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      knobs: { contextTokens: 32768, topK: 20, minP: 0.1, repeatPenalty: 1.2, keepAlive: '5m', think: true },
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect(body.max_tokens).toBe(4096); // no maxOutputTokens → today's default
+    for (const f of ['temperature', 'top_p', 'seed', 'top_k', 'min_p', 'repeat_penalty', 'keep_alive', 'think', 'options']) {
+      expect(f in body).toBe(false);
+    }
+  });
+
+  it('never sends an empty tool_calls array for a text-only assistant message', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: 'plain text reply', toolCalls: [] },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { messages: Array<{ tool_calls?: unknown }> };
+    expect('tool_calls' in body.messages[1]!).toBe(false);
+  });
+
+  it('replays reasoning_content on assistant messages for the official deepseek host', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      baseUrl: 'https://api.deepseek.com/v1',
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: 'prev reply', thinking: 'prior chain of thought' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ role: string; reasoning_content?: string }>;
+    };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.reasoning_content).toBe('prior chain of thought');
+  });
+
+  it('never replays reasoning to openai.com; replays it only on hosts that emitted thinking', async () => {
+    const assistantOf = (call: unknown): unknown => {
+      const body = JSON.parse(String((call as [unknown, { body: string }])[1]!.body)) as {
+        messages: Array<{ role: string; reasoning_content?: unknown }>;
+      };
+      return body.messages.find((m) => m.role === 'assistant');
+    };
+
+    // official openai.com REJECTS reasoning as input — never
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      baseUrl: 'https://api.openai.com/v1',
+      messages: [
+        { role: 'assistant', content: 'prev reply', thinking: 'thoughts' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    expect((assistantOf(vi.mocked(fetch).mock.calls[0]) as { reasoning_content?: unknown }).reasoning_content).toBeUndefined();
+
+    // a gateway that never emitted thinking: unknown field, never sent
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      baseUrl: 'https://gateway.example.com/v1',
+      messages: [
+        { role: 'assistant', content: 'prev reply' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    expect((assistantOf(vi.mocked(fetch).mock.calls[0]) as { reasoning_content?: unknown }).reasoning_content).toBeUndefined();
+
+    // a gateway (llama.cpp serving qwen/kimi-style reasoning) that DID emit
+    // thinking: replay it so the chain-of-thought continues
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      baseUrl: 'https://gateway.example.com/v1',
+      messages: [
+        { role: 'assistant', content: 'prev reply', thinking: 'thoughts' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    expect((assistantOf(vi.mocked(fetch).mock.calls[0]) as { reasoning_content?: unknown }).reasoning_content).toBe('thoughts');
+  });
+
+  it('still maps real tool calls in the request', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'read_scrollback', args: { agentId: 'a1' } }] },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ tool_calls?: Array<{ id: string; function: { name: string } }> }>;
+    };
+    expect(body.messages[1]!.tool_calls).toEqual([
+      { id: 'c1', type: 'function', function: { name: 'read_scrollback', arguments: '{"agentId":"a1"}' } },
+    ]);
+  });
+
+  it('asks for usage on every endpoint and parses the final chunk', async () => {
+    // official deepseek endpoint: stream_options + usage parsed
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"content":"x"}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":40}}}',
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'https://api.deepseek.com' });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { stream_options?: unknown };
+    expect(body.stream_options).toEqual({ include_usage: true });
+    expect(res.usage).toEqual({ inputTokens: 100, cachedTokens: 40, outputTokens: 7 });
+
+    // deepseek's own cache fields
+    stubFetch(
+      sseStream([
+        '{"choices":[],"usage":{"prompt_tokens":90,"completion_tokens":3,"prompt_cache_hit_tokens":60}}',
+        '[DONE]',
+      ]),
+    );
+    const res2 = await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'https://api.deepseek.com' });
+    expect(res2.usage?.cachedTokens).toBe(60);
+
+    // custom endpoint (llama.cpp/LM Studio/vLLM): usage requested and parsed
+    // too — local streams must feed the harness real token accounting
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"content":"y"}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2}}',
+        '[DONE]',
+      ]),
+    );
+    const res3 = await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'https://gateway.example.com/v1' });
+    const body3 = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { stream_options?: unknown };
+    expect(body3.stream_options).toEqual({ include_usage: true });
+    expect(res3.usage).toEqual({ inputTokens: 50, cachedTokens: 0, outputTokens: 2 });
+  });
+});
+
+describe('AnthropicProvider', () => {
+  it('streams a plain text reply', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi "}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there"}}',
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        '{"type":"message_stop"}',
+      ]),
+    );
+    const deltas: string[] = [];
+    const res = await new AnthropicProvider().complete({ ...baseOpts(), onDelta: (d) => deltas.push(d) });
+    expect(res.text).toBe('hi there');
+    expect(deltas).toEqual(['hi ', 'there']);
+    expect(res.toolCalls).toEqual([]);
+  });
+
+  it('collects a tool_use block with split input_json deltas', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu1","name":"read_scrollback"}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"agentId\\":\\"a1\\""}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":",\\"tail\\":3}"}}',
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+        '{"type":"message_stop"}',
+      ]),
+    );
+    const res = await new AnthropicProvider().complete(baseOpts());
+    expect(res.text).toBe('');
+    expect(res.toolCalls).toEqual([{ id: 'tu1', name: 'read_scrollback', args: { agentId: 'a1', tail: 3 } }]);
+  });
+
+  it('captures extended-thinking blocks as thinking', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"first thought "}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"second thought"}}',
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+        '{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}',
+        '{"type":"content_block_stop","index":1}',
+        '{"type":"message_stop"}',
+      ]),
+    );
+    const events: Array<[string, string | undefined]> = [];
+    const res = await new AnthropicProvider().complete({
+      ...baseOpts(),
+      onDelta: (d, t) => events.push([d, t]),
+    });
+    expect(res.thinking).toBe('first thought second thought');
+    expect(res.text).toBe('answer');
+    expect(events).toEqual([
+      ['', 'first thought '],
+      ['', 'second thought'],
+      ['answer', undefined],
+    ]);
+  });
+
+  it('captures thinking blocks with their signatures', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"first "}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"second"}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG-1"}}',
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+        '{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"checked"}}',
+        '{"type":"content_block_stop","index":1}',
+        '{"type":"message_stop"}',
+      ]),
+    );
+    const res = await new AnthropicProvider().complete(baseOpts());
+    expect(res.thinking).toBe('first second');
+    expect(res.text).toBe('checked');
+    expect(res.contentBlocks).toEqual([
+      { type: 'thinking', thinking: 'first second', signature: 'SIG-1' },
+      { type: 'text', text: 'checked' },
+    ]);
+  });
+
+  it('replays captured blocks verbatim when the assistant turn is continued', async () => {
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        {
+          role: 'assistant',
+          content: 'checked',
+          toolCalls: [{ id: 'tu1', name: 'read_scrollback', args: { agentId: 'a1' } }],
+          contentBlocks: [
+            { type: 'thinking', thinking: 'first second', signature: 'SIG-1' },
+            { type: 'tool_use', id: 'tu1', name: 'read_scrollback', input: { agentId: 'a1' } },
+          ],
+        },
+        { role: 'tool', content: 'ok', toolCallId: 'tu1' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+    };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toEqual([
+      { type: 'thinking', thinking: 'first second', signature: 'SIG-1' },
+      { type: 'tool_use', id: 'tu1', name: 'read_scrollback', input: { agentId: 'a1' } },
+    ]);
+  });
+
+  it('falls back to a text/tool_use-only rebuild when thinking lacks its signature', async () => {
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        {
+          role: 'assistant',
+          content: 'maybe',
+          toolCalls: [{ id: 'tu1', name: 'read_scrollback', args: { agentId: 'a1' } }],
+          // unsigned thinking block — must never go back on the wire
+          contentBlocks: [{ type: 'thinking', thinking: 'orphan' }],
+        },
+        { role: 'tool', content: 'ok', toolCallId: 'tu1' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+    };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toEqual([
+      { type: 'text', text: 'maybe' },
+      { type: 'tool_use', id: 'tu1', name: 'read_scrollback', input: { agentId: 'a1' } },
+    ]);
+  });
+
+  it('requests extended thinking on every call', async () => {
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete(baseOpts());
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { thinking?: unknown };
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 4096 });
+  });
+
+  it('honors the thinking policy: budget knob raises the floor, off omits thinking and the clamp', async () => {
+    // budget 8192 → floor = 8192 + 4096 text headroom
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({ ...baseOpts(), thinking: { mode: 'on', budgetTokens: 8192 } });
+    const on = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { thinking?: unknown; max_tokens?: number };
+    expect(on.thinking).toEqual({ type: 'enabled', budget_tokens: 8192 });
+    expect(on.max_tokens).toBe(12288);
+    // a user cap above the floor is preserved
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({ ...baseOpts(), thinking: { mode: 'on', budgetTokens: 4096 }, knobs: { maxOutputTokens: 20000 } });
+    const capped = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { max_tokens?: number };
+    expect(capped.max_tokens).toBe(20000);
+
+    // off: no thinking field, no clamp — the user cap (or 4096) goes as-is
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({ ...baseOpts(), thinking: { mode: 'off' }, knobs: { maxOutputTokens: 4000 } });
+    const off = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { thinking?: unknown; max_tokens?: number };
+    expect('thinking' in off).toBe(false);
+    expect(off.max_tokens).toBe(4000);
+
+    // off without a knob: 4096 default
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({ ...baseOpts(), thinking: { mode: 'off' } });
+    const offDefault = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { max_tokens?: number };
+    expect(offDefault.max_tokens).toBe(4096);
+  });
+
+  it('applies max output (clamped to the thinking floor), temperature and top_p', async () => {
+    // 4000 is below the 8192 floor the extended-thinking budget requires —
+    // the adapter clamps up instead of letting the API 400
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({ ...baseOpts(), knobs: { maxOutputTokens: 4000, temperature: 0.5, topP: 0.8 } });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect(body.max_tokens).toBe(8192);
+    expect(body.temperature).toBe(0.5);
+    expect(body.top_p).toBe(0.8);
+
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({ ...baseOpts(), knobs: { maxOutputTokens: 16384 } });
+    const body2 = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect(body2.max_tokens).toBe(16384);
+  });
+
+  it('never sends fields anthropic does not accept (seed, penalties, keep_alive, think, options)', async () => {
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({
+      ...baseOpts(),
+      knobs: { seed: 7, presencePenalty: 1, frequencyPenalty: 1, topK: 20, minP: 0.1, repeatPenalty: 1.1, keepAlive: '5m', think: true },
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    for (const f of ['seed', 'presence_penalty', 'frequency_penalty', 'top_k', 'min_p', 'repeat_penalty', 'keep_alive', 'think', 'options']) {
+      expect(f in body).toBe(false);
+    }
+    expect(body.max_tokens).toBe(8192); // default preserved
+  });
+
+  it('never sends an empty content array for a reasoning-only assistant message', async () => {
+    stubFetch(sseStream(['{"type":"message_stop"}']));
+    await new AnthropicProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: '', toolCalls: [] },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ content: Array<{ type: string; text?: string }> }>;
+    };
+    const blocks = body.messages[1]!.content;
+    expect(blocks.length).toBeGreaterThan(0);
+    expect(blocks[0]!.type).toBe('text');
+  });
+
+  it('parses usage from message_start and message_delta', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"message_start","message":{"usage":{"input_tokens":200,"cache_read_input_tokens":80,"cache_creation_input_tokens":10}}}',
+        '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":25}}',
+        '{"type":"message_stop"}',
+      ]),
+    );
+    const res = await new AnthropicProvider().complete(baseOpts());
+    // cache CREATION tokens are input-side, not cache hits (audit RV-24):
+    // input = 200 + 10, cached = cache_read only
+    expect(res.usage).toEqual({ inputTokens: 210, cachedTokens: 80, outputTokens: 25 });
+  });
+});
+
+describe('OllamaProvider', () => {
+  it('streams a plain text reply', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"one "}}', '{"message":{"role":"assistant","content":"two"},"done":true}']));
+    const deltas: string[] = [];
+    const res = await new OllamaProvider().complete({ ...baseOpts(), onDelta: (d) => deltas.push(d) });
+    expect(res.text).toBe('one two');
+    expect(deltas).toEqual(['one ', 'two']);
+  });
+
+  it('maps tool_calls with stringified arguments', async () => {
+    stubFetch(
+      ndjsonStream([
+        '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"send_message","arguments":"{\\"to\\":\\"agent-1\\",\\"kind\\":\\"task\\",\\"body\\":\\"go\\"}"}}]},"done":true}',
+      ]),
+    );
+    const res = await new OllamaProvider().complete(baseOpts());
+    expect(res.toolCalls).toEqual([
+      { id: 'tc-send_message-0', name: 'send_message', args: { to: 'agent-1', kind: 'task', body: 'go' } },
+    ]);
+  });
+
+  it('maps tool_calls whose arguments arrive as an already-parsed object (newer ollama builds)', async () => {
+    stubFetch(
+      ndjsonStream([
+        '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"add","arguments":{"a":4,"b":3}}}]},"done":true}',
+      ]),
+    );
+    const res = await new OllamaProvider().complete(baseOpts());
+    expect(res.toolCalls).toEqual([{ id: 'tc-add-0', name: 'add', args: { a: 4, b: 3 } }]);
+    expect(res.text).toBe('');
+  });
+
+  it('maps tool_calls with null or missing arguments to an empty object', async () => {
+    stubFetch(
+      ndjsonStream([
+        '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"ping","arguments":null}},{"function":{"name":"noop"}}]},"done":true}',
+      ]),
+    );
+    const res = await new OllamaProvider().complete(baseOpts());
+    expect(res.toolCalls).toEqual([
+      { id: 'tc-ping-0', name: 'ping', args: {} },
+      { id: 'tc-noop-1', name: 'noop', args: {} },
+    ]);
+  });
+
+  it('never sends an empty tool_calls array (same contract as openai)', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"ok"},"done":true}']));
+    await new OllamaProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: 'plain text reply', toolCalls: [] },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { messages: Array<{ tool_calls?: unknown }> };
+    expect('tool_calls' in body.messages[1]!).toBe(false);
+  });
+
+  it('replays thinking on assistant messages', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: 'prev reply', thinking: 'prior chain of thought' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ role: string; thinking?: string }>;
+    };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.thinking).toBe('prior chain of thought');
+  });
+
+  it('omits thinking when the assistant message has none', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"ok"},"done":true}']));
+    await new OllamaProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: 'plain' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ role: string; thinking?: string }>;
+    };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect('thinking' in assistant!).toBe(false);
+  });
+
+  it('replays tool-call history with object-form arguments (ollama 0.22+ rejects strings)', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete({
+      ...baseOpts(),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'assistant', content: '', toolCalls: [{ id: 'x-1', name: 'send_message', args: { to: 'agent-1', kind: 'task' } }] },
+        { role: 'tool', content: 'ok', toolCallId: 'x-1' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      messages: Array<{ role: string; tool_calls?: Array<{ function?: { arguments?: unknown } }> }>;
+    };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    const args = assistant?.tool_calls?.[0]?.function?.arguments;
+    expect(args).toEqual({ to: 'agent-1', kind: 'task' });
+    expect(typeof args).toBe('object');
+  });
+
+  it('builds the options map plus keep_alive from the knobs and think from the thinking policy', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete({
+      ...baseOpts(),
+      thinking: { mode: 'on' },
+      knobs: {
+        contextTokens: 65536,
+        maxOutputTokens: 1024,
+        temperature: 0.3,
+        topP: 0.9,
+        topK: 40,
+        minP: 0.05,
+        seed: 9,
+        repeatPenalty: 1.1,
+        presencePenalty: 0.5,
+        frequencyPenalty: -0.5,
+        keepAlive: '2h',
+      },
+    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as {
+      options?: Record<string, unknown>;
+      keep_alive?: string;
+      think?: boolean;
+    };
+    expect(body.options).toEqual({
+      num_ctx: 65536,
+      num_predict: 1024,
+      temperature: 0.3,
+      top_p: 0.9,
+      top_k: 40,
+      min_p: 0.05,
+      seed: 9,
+      repeat_penalty: 1.1,
+      presence_penalty: 0.5,
+      frequency_penalty: -0.5,
+    });
+    expect(body.keep_alive).toBe('2h');
+    expect(body.think).toBe(true);
+  });
+
+  it('maps the thinking policy: on → think true, off → think false, unset → omitted', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete({ ...baseOpts(), thinking: { mode: 'off' } });
+    const off = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { think?: boolean };
+    expect(off.think).toBe(false);
+
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete(baseOpts());
+    const auto = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect('think' in auto).toBe(false);
+  });
+
+  it('clamps num_predict to the 512 floor (truncated tool JSON would break the loop)', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete({ ...baseOpts(), knobs: { maxOutputTokens: 10 } });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { options?: Record<string, unknown> };
+    expect(body.options).toEqual({ num_predict: 512 });
+  });
+
+  it('always ships sane local defaults: num_predict 4096 + keep_alive 1h (unset must not mean unlimited generation / 5m eviction)', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true}']));
+    await new OllamaProvider().complete(baseOpts());
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect(body.options).toEqual({ num_predict: 4096 });
+    expect(body.keep_alive).toBe('1h');
+    expect('think' in body).toBe(false);
+  });
+
+  it('parses eval counts from the final done chunk', async () => {
+    stubFetch(
+      ndjsonStream([
+        '{"message":{"role":"assistant","content":"hi"},"done":false}',
+        '{"message":{"role":"assistant","content":" there"},"done":true,"prompt_eval_count":500,"eval_count":42}',
+      ]),
+    );
+    const res = await new OllamaProvider().complete(baseOpts());
+    expect(res.usage).toEqual({ inputTokens: 500, cachedTokens: 0, outputTokens: 42 });
+  });
+
+  it('captures message.thinking as thinking', async () => {
+    stubFetch(
+      ndjsonStream([
+        '{"message":{"role":"assistant","thinking":"mulling "}}',
+        '{"message":{"role":"assistant","thinking":"it over"},"done":false}',
+        '{"message":{"role":"assistant","content":"final"},"done":true}',
+      ]),
+    );
+    const events: Array<[string, string | undefined]> = [];
+    const res = await new OllamaProvider().complete({
+      ...baseOpts(),
+      onDelta: (d, t) => events.push([d, t]),
+    });
+    expect(res.thinking).toBe('mulling it over');
+    expect(res.text).toBe('final');
+    expect(events).toEqual([
+      ['', 'mulling '],
+      ['', 'it over'],
+      ['final', undefined],
+    ]);
+  });
+});
+
+describe('Provider stream-completion enforcement (local servers must never silently truncate)', () => {
+  it('an SSE stream that dies before [DONE] throws (openai adapter — crashed local server)', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"partial"}}]}']));
+    await expect(new OpenAIProvider().complete(baseOpts())).rejects.toThrow(/ended prematurely/);
+  });
+
+  it('an SSE stream that ends with [DONE] but no finish_reason still completes (tolerant gateways)', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.text).toBe('ok');
+    expect(res.finishReason).toBe('stop');
+  });
+
+  it('parses finish_reason from the final chunk (length must reach the harness)', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"content":"cut"},"finish_reason":"length"}]}',
+        '{"choices":[],"finish_reason":"length"}',
+        '[DONE]',
+      ]),
+    );
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.finishReason).toBe('length');
+  });
+
+  it('an NDJSON stream without a done chunk throws (ollama adapter)', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"partial"}}', '{"message":{"role":"assistant","content":" drip"}}']));
+    await expect(new OllamaProvider().complete(baseOpts())).rejects.toThrow(/ended prematurely/);
+  });
+
+  it('parses done_reason into finishReason (ollama)', async () => {
+    stubFetch(ndjsonStream(['{"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"load"}']));
+    const res = await new OllamaProvider().complete(baseOpts());
+    expect(res.finishReason).toBe('load');
+  });
+
+  it('an anthropic stream without message_stop throws', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+      ]),
+    );
+    await expect(new AnthropicProvider().complete(baseOpts())).rejects.toThrow(/ended prematurely/);
+  });
+
+  it('parses stop_reason (max_tokens = clipped) from message_delta', async () => {
+    stubFetch(
+      sseStream([
+        '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cut"}}',
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}',
+        '{"type":"message_stop"}',
+      ]),
+    );
+    const res = await new AnthropicProvider().complete(baseOpts());
+    expect(res.finishReason).toBe('max_tokens');
+  });
+});
+
+describe('OpenAI-compatible base URL normalization', () => {
+  it('appends /v1 to a bare host and strips a pasted full chat path', async () => {
+    const { OpenAIProvider } = await import('../electron/reviewer/providers/openai.js');
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'http://localhost:1234' });
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toBe('http://localhost:1234/v1/chat/completions');
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'http://localhost:1234/v1/chat/completions' });
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toBe('http://localhost:1234/v1/chat/completions');
+  });
+
+  it('leaves a correct /v1 base untouched', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'http://localhost:8080/v1' });
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toBe('http://localhost:8080/v1/chat/completions');
+  });
+
+  it('omits the Authorization header entirely on keyless local servers', async () => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({ ...baseOpts(), apiKey: '', baseUrl: 'http://localhost:8080/v1' });
+    const headers = vi.mocked(fetch).mock.calls[0]![1]!.headers as Record<string, string>;
+    expect(headers.authorization).toBeUndefined();
+  });
+
+  it('retries once WITHOUT stream_options when a strict gateway 400s on it', async () => {
+    const responsive = sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']);
+    const mock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'unknown field stream_options' } }), { status: 400 }))
+      .mockResolvedValue(new Response(responsive, { status: 200 }));
+    vi.stubGlobal('fetch', mock);
+    const res = await new OpenAIProvider().complete({ ...baseOpts(), baseUrl: 'http://localhost:8080/v1' });
+    expect(mock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as { stream_options?: unknown };
+    const secondBody = JSON.parse(String(vi.mocked(fetch).mock.calls[1]![1]!.body)) as { stream_options?: unknown };
+    expect(firstBody.stream_options).toEqual({ include_usage: true });
+    expect(secondBody.stream_options).toBeUndefined();
+    expect(res.text).toBe('ok');
+  });
+});
+
+// ————— streaming robustness (audit C1) —————
+
+function byteStream(bytes: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const b of bytes) controller.enqueue(b);
+      controller.close();
+    },
+  });
+}
+
+function chunked(bytes: Uint8Array, size: number): ReadableStream<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  for (let i = 0; i < bytes.length; i += size) parts.push(bytes.slice(i, i + size));
+  return byteStream(parts);
+}
+
+describe('stream decoding (audit C1)', () => {
+  it('decodes multi-byte UTF-8 split across network chunks intact', async () => {
+    const enc = new TextEncoder();
+    const content = '数据🙂 café — 漢字';
+    const full = enc.encode(
+      `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`,
+    );
+    // 3-byte chunks guarantee splits inside 2/3/4-byte code points
+    stubFetch(chunked(full, 3));
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.text).toBe(content);
+    expect(res.text).not.toContain('\uFFFD');
+  });
+
+  it('decodes split UTF-8 in NDJSON (ollama) streams too', async () => {
+    const enc = new TextEncoder();
+    const content = 'réponse 🙂 数据';
+    const full = enc.encode(
+      `${JSON.stringify({ message: { content } })}\n${JSON.stringify({ done: true, done_reason: 'stop' })}\n`,
+    );
+    stubFetch(chunked(full, 5));
+    const res = await new OllamaProvider().complete(baseOpts());
+    expect(res.text).toBe(content);
+    expect(res.text).not.toContain('\uFFFD');
+  });
+
+  it('handles CRLF line endings and a leading BOM', async () => {
+    const enc = new TextEncoder();
+    const full = enc.encode(
+      '\uFEFFdata: {"choices":[{"delta":{"content":"ok"}}]}\r\n\r\ndata: [DONE]\r\n\r\n',
+    );
+    stubFetch(byteStream([full]));
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.text).toBe('ok');
+  });
+
+  it('joins multi-line data fields per the SSE spec', async () => {
+    const enc = new TextEncoder();
+    // one event whose JSON whitespace is split across two data lines
+    const full = enc.encode('data: {"choices":\ndata: [{"delta":{"content":"ml"}}]}\n\ndata: [DONE]\n\n');
+    stubFetch(byteStream([full]));
+    const res = await new OpenAIProvider().complete(baseOpts());
+    expect(res.text).toBe('ml');
+  });
+
+  it('counts tool-argument-only payloads as stream activity', async () => {
+    stubFetch(
+      sseStream([
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_scrollback","arguments":"{}"}}]}}]}',
+        '{"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
+        '[DONE]',
+      ]),
+    );
+    let activity = 0;
+    const res = await new OpenAIProvider().complete({
+      ...baseOpts(),
+      onActivity: () => {
+        activity += 1;
+      },
+    });
+    expect(res.toolCalls).toHaveLength(1);
+    expect(activity).toBeGreaterThanOrEqual(2);
+  });
+
+  it('generates unique fallback tool ids across separate turns', async () => {
+    const one = [
+      '{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read_scrollback","arguments":"{}"}}]}}]}',
+      '{"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
+      '[DONE]',
+    ];
+    stubFetch(sseStream(one));
+    const a = await new OpenAIProvider().complete(baseOpts());
+    stubFetch(sseStream(one));
+    const b = await new OpenAIProvider().complete(baseOpts());
+    expect(a.toolCalls[0]!.id).not.toBe(b.toolCalls[0]!.id);
+  });
+
+  it('captures redacted_thinking blocks verbatim', async () => {
+    const ev = (payload: unknown): string => JSON.stringify(payload);
+    stubFetch(
+      sseStream([
+        ev({ type: 'message_start', message: { usage: { input_tokens: 10, cache_read_input_tokens: 5, cache_creation_input_tokens: 3 } } }),
+        ev({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: 'ENC' } }),
+        ev({ type: 'content_block_stop' }),
+        ev({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }),
+        ev({ type: 'message_stop' }),
+      ]),
+    );
+    const res = await new AnthropicProvider().complete(baseOpts());
+    expect(res.contentBlocks).toEqual([{ type: 'redacted_thinking', data: 'ENC' }]);
+    // cache creation is input, not a cache hit
+    expect(res.usage).toEqual({ inputTokens: 13, cachedTokens: 5, outputTokens: 1 });
+  });
+});
+
+describe('versioned base URLs are never rewritten (audit RV-05)', () => {
+  it.each([
+    'https://generativelanguage.googleapis.com/v1beta/openai',
+    'https://open.bigmodel.cn/api/paas/v4',
+    'https://ark.cn-beijing.volces.com/api/v3',
+    'https://api.deepinfra.com/v1/openai',
+    'https://api.novita.ai/v3/openai',
+  ])('keeps %s intact', async (baseUrl) => {
+    stubFetch(sseStream(['{"choices":[{"delta":{"content":"ok"}}]}', '[DONE]']));
+    await new OpenAIProvider().complete({ ...baseOpts(), baseUrl });
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toBe(`${baseUrl}/chat/completions`);
+  });
+});

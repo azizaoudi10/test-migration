@@ -1,0 +1,848 @@
+import { open, readFile, readdir, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join, isAbsolute, relative } from 'node:path';
+import { Worker } from 'node:worker_threads';
+import { runSearch, type SearchRequest } from './reviewer-search.js';
+import { confinePath } from './fs-scope.js';
+import type { FraktoleMessage, ReviewerQuestion, ReviewerState, ReviewerTask } from '../src/shared/ipc.js';
+import { sanitizeChatText } from '../src/shared/sanitize.js';
+import { DEFAULT_LAUNCHERS, HARNESS_SLOT_COUNT, commandIsPlainLaunch, effectiveAllowlist, launcherFirstToken } from '../src/shared/launchers.js';
+import { emptyState } from './reviewer-state.js';
+import { ORCHESTRATOR_ID, messageId } from './mailbox.js';
+import type { TileRecorder } from './tile-recorder.js';
+
+/** What the harness can reach: the live recording, the mailboxes, and the
+ *  project the session is bound to. */
+export interface ReviewerToolContext {
+  sessionId: string;
+  sessionDir: string;
+  cwd: string;
+  /** Filesystem roots the reviewer may read (registered project roots plus
+   *  the active fork). Paths outside are refused — the reviewer reads
+   *  untrusted content and must not be prompt-injectable into host-wide
+   *  reads (audit RV-04/SEC-2). Falls back to [cwd] when absent. */
+  roots?: string[];
+  recorder: TileRecorder;
+  router: {
+    sendFromOrchestrator(msg: FraktoleMessage): Promise<boolean>;
+  };
+  tileOfAgent(agentId: string): string | null;
+  agentOfTile(tileId: string): string | null;
+  cwdOfAgent(agentId: string): string | null;
+  /** The durable goal/task ledger; the host owns persistence and always
+   *  injects these callbacks when it builds the merged context. */
+  getState?(): ReviewerState;
+  updateTask?(task: ReviewerTask): Promise<void>;
+  /** Suspends the loop until the user answers the question card. */
+  askUser?(question: string, kind: ReviewerQuestion['kind'], agentId?: string): Promise<string>;
+  /** Raw PTY kill (the host guards grants before routing here). */
+  killAgent?(tileId: string): Promise<string>;
+  /** Grant-checked kill (single-use per agent); the host enforces policy. */
+  tryKillAgent?(agentId: string): Promise<string>;
+  /** Spawn an agent tile; main allocates the id and mounts it in the UI.
+   *  userPicked=true marks a launcher the USER chose (ask_user answer /
+   *  remembered ledger pick) — it skips the allowlist but never the
+   *  plain-command check. */
+  spawnAgent?(kind: string, cwd: string, opts?: { userPicked?: boolean }): Promise<string>;
+  /** Live agent tile count (spawn cap). */
+  agentCount?(): number;
+  /** The configured launcher command ('' = none). */
+  getAgentCommand?(): string;
+  /** Set or clear the loop carrier goal (user-authorized: always allowed). The
+   *  model may also subdivide the CURRENT goal into sub-goals. Returns false
+   *  when there is nothing to apply (subdividing without an armed goal). */
+  setGoal?(text: string, subGoals?: Array<{ text: string; done: boolean }>): Promise<boolean>;
+  /** The mailbox message log for the session. */
+  listMessages?(): Promise<FraktoleMessage[]>;
+  /** Write into an existing agent's terminal (send_keystroke).
+   *  raw=true sends the bytes verbatim — no trailing newline
+   *  is appended (keystrokes press their own keys). */
+  writeToAgent?(agentId: string, command: string, opts?: { raw?: boolean }): Promise<string>;
+  /** True only for tiles running a harness launcher (kind === 'agent'); a bare
+   *  shell tile is never a valid target for terminal input. */
+  isHarnessTile?(tileId: string): boolean;
+  /** The user's extra allowed launchers (settings); extends the built-in
+   *  defaults — gates terminal input into shell tiles. */
+  getAllowedLaunchers?(): Promise<string[]>;
+  /** The model-facing agent harnesses in priority order (settings slots;
+   *  slot 1 is the default spawn kind). Empty → constructor defaults. */
+  getHarnesses?(): string[];
+  /** Every agent tile in the session (including silent ones with no output
+   *  yet) — list_tiles merges this with the live recording stats. */
+  listAgents?(): Array<{ agentId: string; cwd: string | null }>;
+  /** Reload the Test tab's guest page. */
+  reloadTestPage?(): Promise<string>;
+  /** Open a URL in the Test tab (the embedded mini browser). */
+  openTestPage?(url: string): Promise<string>;
+  /** Read the Test tab's live state (url/title/loading/console errors). */
+  readTestPage?(): Promise<string>;
+  /** Save a screenshot of the Test tab for the user; returns the path. */
+  screenshotTestPage?(): Promise<string>;
+}
+
+export interface ReviewerTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  run(args: Record<string, unknown>, ctx: ReviewerToolContext): Promise<string>;
+}
+
+const TOOL_RESULT_CAP = 20_000;
+
+/** Named key combos for send_keystroke — shift-tab is the opencode
+ *  plan/build toggle (xterm CSI Z). */
+const KEY_ESCAPES: Record<string, string> = {
+  'shift-tab': '\x1b[Z',
+  tab: '\t',
+  enter: '\r',
+  escape: '\x1b',
+  'ctrl-c': '\x03',
+  up: '\x1b[A',
+  down: '\x1b[B',
+  left: '\x1b[D',
+  right: '\x1b[C',
+};
+
+/** Upper bound for the bytes typed into an agent's terminal in one call —
+ *  the model must not be able to flood a live PTY. */
+const TERMINAL_INPUT_CAP = 10_000;
+/** send_message body cap: bodies are written into a live PTY and the
+ *  dispatch log; 32K is far beyond any sane instruction and bounds both. */
+const MESSAGE_BODY_CAP = 32_000;
+
+/** ReDoS and the search walk live in reviewer-search.ts, executed in a
+ *  worker thread (search-worker.cjs) under a hard timeout (audit SEC-6). */
+const SEARCH_WORKER_TIMEOUT_MS = 750;
+
+export function capResult(text: string): string {
+  if (text.length <= TOOL_RESULT_CAP) return text;
+  return `${text.slice(0, TOOL_RESULT_CAP)}\n...[truncated]`;
+}
+
+/** Shown when a resolved tile has no live recording yet (e.g. the recorder
+ *  started empty after a restart) — never a silent "(empty)". */
+function noLiveHint(): string {
+  return 'no output recorded yet — the agent has not printed anything; check again shortly';
+}
+
+/** Terminal-input tools (send_keystroke) may
+ *  freely target a tile running a harness launcher. A bare shell tile accepts
+ *  ONLY the command that starts an allowlisted launcher (plain invocation, no
+ *  shell metacharacters) — anything else would execute as arbitrary shell
+ *  commands, the path where the orchestrator "does the work itself" instead of
+ *  delegating. Returns an error string, or null when the input is allowed. */
+async function terminalInputGuard(agentId: string, ctx: ReviewerToolContext, input?: string): Promise<string | null> {
+  const id = agentId.trim();
+  const tileId = ctx.tileOfAgent?.(id);
+  if (!tileId) return `error: unknown agent ${id || '(empty)'}`;
+  if (ctx.isHarnessTile?.(tileId)) return null;
+  const cmd = typeof input === 'string' ? input.trim() : '';
+  if (
+    cmd.length > 0 &&
+    commandIsPlainLaunch(cmd) &&
+    effectiveAllowlist(await ctx.getAllowedLaunchers?.(), ctx.getAgentCommand?.()).includes(launcherFirstToken(cmd))
+  ) {
+    return null;
+  }
+  return 'error: only allowlisted launchers (e.g. opencode) may be started in a shell tile — delegate work with send_message or spawn_agent';
+}
+
+/** The slice of ReviewerToolContext the launcher gate needs — lets host-side
+ *  callers (spawnAgentInSession) reuse the exact same rule. */
+export interface LauncherGateContext {
+  getAllowedLaunchers?(): Promise<string[]>;
+  /** May be sync (reviewer memory) or async (settings read). */
+  getAgentCommand?(): string | Promise<string>;
+}
+
+/** spawn_agent's kind is typed into a fresh shell as a command — validate it
+ *  exactly like terminal input into a shell tile. HARNESS-ONLY: 'shell' is
+ *  rejected — the reviewer never spawns bare shell tiles (they are
+ *  user-created, or spawned user-driven from the remote). The internal
+ *  ask_user pick bypasses this gate for the vestigial no-harness case.
+ *  Exported so the host-side spawn path (spawnAgentInSession) enforces the
+ *  same rule as the tool. */
+export async function validateLauncherKind(kind: string, ctx: LauncherGateContext): Promise<string | null> {
+  const allowed =
+    commandIsPlainLaunch(kind) &&
+    effectiveAllowlist(await ctx.getAllowedLaunchers?.(), await ctx.getAgentCommand?.()).includes(launcherFirstToken(kind));
+  if (allowed && launcherFirstToken(kind) === 'shell') {
+    return 'error: bare shell tiles are never spawnable — spawn a harness kind instead (plain shells are user-created, never spawned)';
+  }
+  return allowed
+    ? null
+    : 'error: unknown launcher — use one of the harness kinds (e.g. opencode), or ask the user with ask_user';
+}
+
+const TOOLS: ReviewerTool[] = [
+  {
+    name: 'list_tiles',
+    description: 'List every agent tile: agent id, tile id, working dir, recorded line count, and seconds since the tile last produced output (dead-tile detection). A null lastActiveAgoSec means the agent spawned but has not printed anything yet. Call this FIRST at the start of an engagement.',
+    inputSchema: { type: 'object', properties: {} },
+    async run(_args, ctx) {
+      const now = Date.now();
+      const stats = new Map<string, { lines: number; lastAt: number }>();
+      for (const [tileId, summary] of ctx.recorder.list().entries()) {
+        const agentId = ctx.agentOfTile(tileId) ?? tileId;
+        stats.set(agentId, summary);
+      }
+      const row = (agentId: string, s?: { lines: number; lastAt: number }): Record<string, unknown> => ({
+        tileId: ctx.tileOfAgent(agentId) ?? null,
+        agentId,
+        cwd: ctx.cwdOfAgent(agentId),
+        lines: s?.lines ?? 0,
+        lastActiveAgoSec: s ? Math.max(0, Math.round((now - s.lastAt) / 1000)) : null,
+      });
+      // every session agent, even one that just spawned and has not printed
+      // anything yet — a silent tile is a fact the reviewer must see
+      const agents = ctx.listAgents?.() ?? [];
+      const rows = agents.map((a) => row(a.agentId, stats.get(a.agentId)));
+      for (const [agentId, s] of stats) {
+        if (!agents.some((a) => a.agentId === agentId)) rows.push(row(agentId, s));
+      }
+      if (rows.length === 0) return 'no tiles recorded yet';
+      return JSON.stringify(rows, null, 2);
+    },
+  },
+  {
+    name: 'read_scrollback',
+    description: "Read an agent's output history — the canonical way to monitor your workforce. While the agent runs, this reads its live recording (a real terminal emulation: full-screen TUIs like opencode render as clean lines); otherwise it reads the on-disk capture (fresh within ~1s). Up to 5000 lines. Use it to judge a completed piece of work — no completion signal ever arrives through the message log, so poll this instead.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: 'agent id (from list_tiles)' },
+        tail: { type: 'number', description: 'last N lines (default 200, max 5000)' },
+      },
+    },
+    async run(args, ctx) {
+      const agentId = typeof args.agentId === 'string' ? args.agentId : '';
+      if (!agentId) return 'error: agentId required';
+      // agent ids are internally generated agent-<n> — reject anything else
+      // before it ever reaches a path join (same rule as the spawn host)
+      if (!/^agent-\d+$/.test(agentId)) return 'error: invalid agentId';
+      const n = clampInt(args.tail, 200, 1, 5000);
+      // while the agent runs, its live recording is the freshest view (zero
+      // lag) — use it directly and never fall back to a save-time snapshot
+      const tileId = ctx.tileOfAgent(agentId);
+      if (tileId && ctx.recorder.has(tileId)) {
+        const lines = ctx.recorder.tail(tileId, n);
+        return capResult(lines.join('\n') || noLiveHint());
+      }
+      // never let a model-supplied id escape the session's scrollback dir
+      // (read_file allows absolute paths on purpose — this tool does not)
+      const scrollbackRoot = join(ctx.sessionDir, 'scrollback');
+      const abs = join(scrollbackRoot, `${agentId}.json`);
+      const rel = relative(scrollbackRoot, abs);
+      if (rel.startsWith('..') || isAbsolute(rel)) {
+        return 'error: invalid agentId';
+      }
+      let raw: string;
+      try {
+        raw = await readFile(abs, 'utf8');
+      } catch {
+        return 'error: no scrollback for this agent yet';
+      }
+      let lines: string[];
+      try {
+        lines = (JSON.parse(raw) as { lines: string[] }).lines ?? [];
+      } catch {
+        return 'error: corrupt scrollback file';
+      }
+      return capResult(lines.slice(-n).join('\n') || '(empty)');
+    },
+  },
+  {
+    name: 'send_message',
+    description:
+      'Send instructions to an agent. This is the PRIMARY way substantive work gets done — dispatch implementation to agents instead of doing it yourself; always state precise, verifiable acceptance criteria in the body. Prefer it over doing the work yourself when an agent owns the area. The body is echoed into the agent\'s terminal and stored in the dispatch log: monitor progress with read_scrollback afterwards (no result ever arrives through the log — poll the terminal output instead). Only harnessed agents can receive tasks — sending to a bare shell tile is refused, since the body would execute as shell commands.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'agent id (from list_tiles)' },
+        body: { type: 'string', description: 'the message body, with precise acceptance criteria' },
+      },
+      required: ['to', 'body'],
+    },
+    async run(args, ctx) {
+      const to = typeof args.to === 'string' ? args.to : '';
+      const body = typeof args.body === 'string' ? args.body : '';
+      if (!to || !body) return 'error: to and body are required';
+      // a multi-megabyte body would be written straight into a live PTY:
+      // cap it like every other terminal input path (send_keystroke caps at
+      // 10K) — a dispatch that large is a planning failure, not a task
+      if (body.length > MESSAGE_BODY_CAP) {
+        return `error: message body too large (${body.length} chars, cap ${MESSAGE_BODY_CAP}) — split the task or reference files instead`;
+      }
+      // defense in depth: a body typed into a bare shell executes as shell
+      // commands and the task is silently lost (the classic small-model
+      // stall) — refuse at runtime, not just in the description
+      const tileId = ctx.tileOfAgent?.(to);
+      if (tileId && ctx.isHarnessTile && !ctx.isHarnessTile(tileId)) {
+        return `error: ${to} is a bare shell tile — tasks need a harnessed agent; spawn one first with spawn_agent`;
+      }
+      const ok = await ctx.router.sendFromOrchestrator({
+        id: messageId(),
+        from: ORCHESTRATOR_ID,
+        to,
+        kind: 'task',
+        body,
+        at: Date.now(),
+      });
+      return ok ? `sent task to ${to}` : `error: cannot reach ${to} (unknown agent?)`;
+    },
+  },
+  {
+    name: 'read_state',
+    description: 'Return the current goal, sub-goals and task ledger as JSON (the durable loop carrier state, surviving compactions). Check it when you need to recall what was assigned, to whom, and in what state.',
+    inputSchema: { type: 'object', properties: {} },
+    async run(_args, ctx) {
+      return JSON.stringify(ctx.getState?.() ?? emptyState(), null, 2);
+    },
+  },
+  {
+    name: 'update_task',
+    description:
+      'Upsert a row in the task ledger: give id to update an existing task, omit it to create one. status: pending/active/done/failed. Tasks are concrete work items assigned to agents; sub-goals (set_goal) are the goal breakdown — track both. Keep the ledger current on every assignment and every completion — it is your durable memory across compactions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'existing task id to update (omit to create)' },
+        agentId: { type: 'string', description: 'agent id (from list_tiles)' },
+        title: { type: 'string', description: 'short task title' },
+        status: { type: 'string', enum: ['pending', 'active', 'done', 'failed'], description: 'ledger state of the task' },
+      },
+      required: ['title'],
+    },
+    async run(args, ctx) {
+      const title = typeof args.title === 'string' ? args.title.trim() : '';
+      if (title.length === 0) return 'error: title required';
+      const status =
+        args.status === 'pending' || args.status === 'active' || args.status === 'done' || args.status === 'failed'
+          ? args.status
+          : 'pending';
+      const task: ReviewerTask = {
+        id: typeof args.id === 'string' && args.id.length > 0 ? args.id : newTaskId(),
+        agentId: typeof args.agentId === 'string' && args.agentId.length > 0 ? args.agentId : null,
+        title,
+        status,
+        updatedAt: Date.now(),
+      };
+      await ctx.updateTask?.(task);
+      return `task ${task.id} ${task.status === 'pending' ? 'recorded' : `→ ${task.status}`}`;
+    },
+  },
+  {
+    name: 'ask_user',
+    description:
+      'Ask the user a free-form question and WAIT for the answer (the loop suspends, up to 10 minutes before it times out with an error). Use it for uncertain steps and decisions that need the user.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'the question shown to the user' },
+        agentId: { type: 'string', description: 'agent id (from list_tiles)' },
+      },
+      required: ['question'],
+    },
+    async run(args, ctx) {
+      const question = typeof args.question === 'string' ? args.question.trim() : '';
+      if (question.length === 0) return 'error: question required';
+      const agentId = typeof args.agentId === 'string' && args.agentId.length > 0 ? args.agentId : undefined;
+      if (!ctx.askUser) return 'error: ask_user unavailable';
+      try {
+        const answer = await ctx.askUser(question, 'free', agentId);
+        return `user answered: ${sanitizeChatText(answer)}`;
+      } catch (err) {
+        return `error: ${(err as Error).message}`;
+      }
+    },
+  },
+  {
+    name: 'kill_agent',
+    description:
+      'Kill an agent tile (terminates its PTY and closes the tile). Always allowed — no confirmation needed. The user may also kill directly with /kill. Never target the orchestrator. The killed agent\'s output history stays readable via read_scrollback.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: 'agent id (from list_tiles)' },
+      },
+      required: ['agentId'],
+    },
+    async run(args, ctx) {
+      const agentId = typeof args.agentId === 'string' ? args.agentId.trim() : '';
+      if (agentId.length === 0) return 'error: agentId required';
+      return ctx.tryKillAgent?.(agentId) ?? 'error: kill unavailable';
+    },
+  },
+  {
+    name: 'spawn_agent',
+    description:
+      "Spawn a NEW agent tile — the ONLY way to grow the workforce. HARNESS-ONLY: kind must be one of the harness kinds in the schema enum (slot 1 is the default; omit kind to use the remembered pick or the default). The launcher is typed into the fresh shell immediately at spawn, so the harness boots by construction and the agent can always receive tasks. Bare shells are never spawnable — plain shells are user-created (terminal tab) or remote-spawned; ask the user with ask_user when no harness fits. Capped at 8 agents. To steer a RUNNING harness (slash-commands like /compact) use send_keystroke.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'working directory (defaults to the project root)' },
+        kind: { type: 'string', description: 'harness to boot — one of the enum values (slot 1 is the default); empty = remembered pick or default' },
+      },
+    },
+    async run(args, ctx) {
+      const cwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : '';
+      const kindArg = typeof args.kind === 'string' ? args.kind.trim() : '';
+      const configCommand = ctx.getAgentCommand?.() ?? '';
+      let kind = kindArg;
+      if (kind.length === 0) kind = ctx.getState?.().lastAgentKind ?? '';
+      // slot 1 is the default harness; the legacy agentCommand stays as the
+      // fallback for installs that configured it but never set slots
+      if (kind.length === 0) kind = ctx.getHarnesses?.()[0] ?? '';
+      if (kind.length === 0) kind = configCommand;
+      let asked = false;
+      if (kind.length === 0) {
+        if (!ctx.askUser) return 'error: no agent kind — ask the user which agent to spawn';
+        kind = (await ctx.askUser('which harness should I spawn? (one of the schema enum values)', 'agent-kind')).trim();
+        if (/^(skipped?|skip)$/i.test(kind)) return 'error: spawn cancelled by the user';
+        asked = true;
+      }
+      if (kind.length === 0) return 'error: no agent kind';
+      // a bare shell is NEVER spawnable, consent or not: the harness-only
+      // contract must not be bypassable via a remembered/answered kind
+      // (audit RV-28)
+      if (kind.toLowerCase() === 'shell') {
+        return 'error: bare shells are never spawnable — pick a harness kind';
+      }
+      // a launcher the USER picked (ask_user answer, or the ledger's
+      // remembered pick) is authorized by consent — the allowlist does not
+      // apply to it, but the plain-command check always does
+      const userPicked = asked || kind === ctx.getState?.().lastAgentKind;
+      if (!userPicked) {
+        const kindErr = await validateLauncherKind(kind, ctx);
+        if (kindErr) return kindErr;
+      } else if (!commandIsPlainLaunch(kind)) {
+        return 'error: launcher command is not a plain invocation (no shell metacharacters)';
+      }
+      const count = ctx.agentCount?.() ?? 0;
+      if (count >= 8) return `error: agent cap (8) reached — ${count} tiles running`;
+      return ctx.spawnAgent?.(kind, cwd, { userPicked }) ?? 'error: spawn unavailable';
+    },
+  },
+  {
+    name: 'set_goal',
+    description:
+      'Set a new loop carrier goal (replaces the current one and re-arms the loop), clear it by omitting text, or subdivide the CURRENT goal into sub-goals with subGoals. You are authorized to set goals when the situation calls for it — when a big goal is armed, break it into smaller sub-goals with subGoals and keep the list current as you complete items.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'the new top-level goal (omit to keep the current one when only sub-goals change; empty clears the goal)' },
+        subGoals: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              text: { type: 'string', description: 'one sub-goal' },
+              done: { type: 'boolean', description: 'true when this sub-goal is completed' },
+            },
+            required: ['text'],
+          },
+          description: 'the full current sub-goal list (replaces it; requires an active goal)',
+        },
+      },
+    },
+    async run(args, ctx) {
+      if (!ctx.setGoal) return 'error: set_goal unavailable';
+      const hasText = typeof args.text === 'string';
+      const text = hasText ? (args.text as string).trim() : null;
+      const rawSubs = Array.isArray(args.subGoals) ? args.subGoals : [];
+      const subGoals = rawSubs
+        .filter((s): s is { text?: unknown; done?: unknown } => typeof s === 'object' && s !== null)
+        .map((s) => ({ text: typeof s.text === 'string' ? s.text.trim() : '', done: s.done === true }))
+        .filter((s) => s.text.length > 0);
+      // a malformed/truncated call (no text key, no sub-goals) must NEVER
+      // clear an armed goal — only an explicit empty text does (audit RV-12)
+      if (!hasText && subGoals.length === 0) {
+        return 'error: nothing to apply — provide text (new goal), subGoals (subdivide the current goal), or an empty text to clear';
+      }
+      const applied = await ctx.setGoal(text ?? '', subGoals.length > 0 ? subGoals : undefined);
+      if (!applied) {
+        return 'error: no active goal to subdivide — set a text goal first (audit E9)';
+      }
+      if (subGoals.length > 0 && (text === null || text.length === 0)) {
+        return `sub-goals set: ${subGoals.map((s) => s.text).join(' | ')}`;
+      }
+      return text !== null && text.length > 0 ? `goal set: ${sanitizeChatText(text)}` : 'goal cleared';
+    },
+  },
+  {
+    name: 'open_test_page',
+    description:
+      "Open a URL in the Test tab — the embedded mini browser for exercising webapp results (an agent's dev server, a built artifact). The Test tab switches into view for the user. Use it when an agent reports a working server or page, then read_test_page to check it loaded cleanly.",
+    inputSchema: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'the URL to open (http/https; localhost allowed)' } },
+      required: ['url'],
+    },
+    async run(args, ctx) {
+      const url = typeof args.url === 'string' ? args.url.trim() : '';
+      if (url.length === 0) return 'error: url required';
+      return ctx.openTestPage?.(url) ?? 'error: test tab unavailable';
+    },
+  },
+  {
+    name: 'read_test_page',
+    description:
+      "Read the Test tab's state: URL, title, loading flag, console-error count and the last 20 console messages (levels + text). Use it to verify a page loaded cleanly and to debug failures after a fix.",
+    inputSchema: { type: 'object', properties: {} },
+    async run(_args, ctx) {
+      return ctx.readTestPage?.() ?? 'error: test tab unavailable';
+    },
+  },
+  {
+    name: 'screenshot_test_page',
+    description:
+      "Save a PNG screenshot of the Test tab's current page under the session's reviewer/shots directory FOR THE USER. You cannot see images — prefer read_test_page for verification.",
+    inputSchema: { type: 'object', properties: {} },
+    async run(_args, ctx) {
+      return ctx.screenshotTestPage?.() ?? 'error: test tab unavailable';
+    },
+  },
+  {
+    name: 'list_dir',
+    description:
+      'List a directory: directories first (trailing slash), then files with sizes. depth 1-3 (default 1), ~500 entries max, hidden entries skipped unless asked, node_modules/.git/dist-like dirs skipped. Use freely to understand and verify the codebase yourself before judging agent work; for finding code use search_files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'directory (defaults to the project root)' },
+        depth: { type: 'number', description: 'recursion depth (1–3, default 1)' },
+        includeHidden: { type: 'boolean', description: 'include dotfiles/dot-directories' },
+      },
+    },
+    async run(args, ctx) {
+      const path = typeof args.path === 'string' && args.path.trim().length > 0 ? args.path.trim() : '';
+      const abs = path.startsWith('/') ? path : join(ctx.cwd, path);
+      const scoped = await confineRead(abs, ctx);
+      if (scoped === null) return 'error: path outside the project scope';
+      const depth = clampInt(args.depth, 1, 1, 3);
+      const includeHidden = args.includeHidden === true;
+      return listDir(scoped, depth, includeHidden);
+    },
+  },
+  {
+    name: 'search_files',
+    description:
+      'Search for lines matching a regex (e.g. stubs, TODOs, wrong symbols) — returns path:line: text, capped. `path` may be a single FILE or a directory to walk (up to ~5000 files scanned; hidden and build dirs skipped); a missing path errors. Use freely to verify an agent actually implemented something and did not leave placeholders.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'regular expression to match against each line' },
+        path: { type: 'string', description: 'a file to search, or a directory to walk (defaults to the project root)' },
+        glob: { type: 'string', description: 'file-name filter, e.g. "*.tsx" or "*.{ts,tsx}" (* wildcard only)' },
+        maxMatches: { type: 'number', description: 'maximum hits (default 100)' },
+      },
+      required: ['pattern'],
+    },
+    async run(args, ctx) {
+      const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+      if (pattern.length === 0) return 'error: pattern required';
+      const path = typeof args.path === 'string' && args.path.trim().length > 0 ? args.path.trim() : '';
+      const abs = path.startsWith('/') ? path : join(ctx.cwd, path);
+      const scoped = await confineRead(abs, ctx);
+      if (scoped === null) return 'error: path outside the project scope';
+      const glob = typeof args.glob === 'string' && args.glob.trim().length > 0 ? args.glob.trim() : undefined;
+      const maxMatches = clampInt(args.maxMatches, 100, 1, 500);
+      return searchFiles(pattern, scoped, glob, maxMatches, path);
+    },
+  },
+  {
+    name: 'list_messages',
+    description:
+      "Read the session's dispatch log (tasks you sent to agents) — filter by kind, limit to the last N. Bodies are truncated to 300 chars; very old logs may still contain historic result rows. Audit-only: it never carries results back, so judge completion with read_scrollback instead.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['task', 'note'], description: 'only messages of this kind' },
+        limit: { type: 'number', description: 'last N messages (default 50, max 200)' },
+      },
+    },
+    async run(args, ctx) {
+      const kind = args.kind === 'task' || args.kind === 'note' ? args.kind : null;
+      const limit = clampInt(args.limit, 50, 1, 200);
+      const all = await ctx.listMessages?.();
+      if (!all) return 'error: message log unavailable';
+      const rows = all
+        .filter((m) => kind === null || m.kind === kind)
+        // newest-first: the model audits recent dispatch state, not the
+        // oldest rows (audit RV-08) — sort defensively so any input order
+        // yields the same answer
+        .slice()
+        .sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
+        .slice(0, limit)
+        .map((m) => ({
+          from: m.from,
+          to: m.to,
+          kind: m.kind,
+          at: safeIso(m.at),
+          body: sanitizeChatText(m.body).slice(0, 300),
+        }));
+      return rows.length > 0 ? JSON.stringify(rows, null, 2) : '(no messages yet — tasks you dispatch with send_message appear here)';
+    },
+  },
+  {
+    name: 'send_keystroke',
+    description:
+      "Send key presses into an agent's terminal, like the user pressing keys. Named combos: shift-tab (opencode plan/build toggle), tab, enter, escape, ctrl-c, up, down, left, right. Any other string is sent literally. Use it for interrupts (ctrl-c) and TUI mode toggles while the agent is busy, and to run slash-commands in a running harness (e.g. keys ['/compact', 'enter']). Verify the effect with read_scrollback afterwards.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: 'the agent whose tile receives the keys' },
+        keys: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'named combos (shift-tab, enter, escape, ctrl-c, arrows) or literal text, in order',
+        },
+      },
+      required: ['agentId', 'keys'],
+    },
+    async run(args, ctx) {
+      const agentId = typeof args.agentId === 'string' ? args.agentId.trim() : '';
+      const keys = Array.isArray(args.keys) ? args.keys.filter((k): k is string => typeof k === 'string') : [];
+      if (agentId.length === 0 || keys.length === 0) return 'error: agentId and at least one key required';
+      const bytes = keys.map((k) => KEY_ESCAPES[k] ?? k).join('');
+      if (bytes.length > TERMINAL_INPUT_CAP) return `error: keystrokes too large (${bytes.length} chars, cap ${TERMINAL_INPUT_CAP})`;
+      const err = await terminalInputGuard(agentId, ctx, bytes);
+      if (err) return err;
+      const result = await ctx.writeToAgent?.(agentId, bytes, { raw: true });
+      return result ?? `error: unknown agent ${agentId}`;
+    },
+  },
+  {
+    name: 'reload_test_page',
+    description:
+      "Reload the Test tab's current page. Use it after a fix: reload, then read_test_page to verify the console is clean.",
+    inputSchema: { type: 'object', properties: {} },
+    async run(_args, ctx) {
+      return ctx.reloadTestPage?.() ?? 'error: test tab unavailable';
+    },
+  },
+  {
+    name: 'read_file',
+    description:
+      'Read one or more files from the project (or absolute paths), up to 4 MiB each. Pass paths to read several related files in one call. Use freely to grasp the codebase yourself. For browsing use list_dir; for finding code use search_files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'single file to read (or use paths for several)' },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'several files to read in one call (each capped at 4 MiB)',
+        },
+      },
+      anyOf: [{ required: ['path'] }, { required: ['paths'] }],
+    },
+    async run(args, ctx) {
+      const single = typeof args.path === 'string' && args.path.length > 0 ? args.path : null;
+      const list = Array.isArray(args.paths) ? args.paths.filter((p): p is string => typeof p === 'string') : [];
+      const targets = single ? [single] : list;
+      if (targets.length === 0) return 'error: path or paths required';
+      if (targets.length > 8) return 'error: at most 8 files per call';
+      const out: string[] = [];
+      for (const path of targets) {
+        const abs = path.startsWith('/') ? path : join(ctx.cwd, path);
+        const scoped = await confineRead(abs, ctx);
+        if (scoped === null) {
+          out.push(`=== ${path} ===\nerror: path outside the project scope`);
+          continue;
+        }
+        try {
+          // size-check BEFORE reading: a huge file must never be buffered
+          // into the main process just to be rejected
+          const st = await stat(scoped);
+          if (st.size > 4 * 1024 * 1024) {
+            out.push(`=== ${path} ===\nerror: file larger than 4 MiB`);
+            continue;
+          }
+          const content = await readTextCapped(scoped);
+          out.push(targets.length === 1 ? content : `=== ${path} ===\n${content}`);
+        } catch (err) {
+          out.push(`=== ${path} ===\nerror: ${(err as NodeJS.ErrnoException).message}`);
+        }
+      }
+      return out.join('\n\n');
+    },
+  },
+];
+
+export class ReviewerTools {
+  private readonly tools = new Map(TOOLS.map((t) => [t.name, t]));
+  /** The effective harness list in priority order (settings slots, or the
+   *  built-in launchers minus 'shell' when no slots are set). Single source
+   *  of truth for the spawn_agent kind enum and the slot-1 default. */
+  readonly harnesses: string[];
+
+  constructor(harnesses?: string[]) {
+    const clean = (harnesses ?? []).map((h) => h.trim()).filter((h) => h.length > 0).slice(0, HARNESS_SLOT_COUNT);
+    this.harnesses =
+      clean.length > 0
+        ? clean
+        : [...DEFAULT_LAUNCHERS].filter((h) => h !== 'shell').slice(0, HARNESS_SLOT_COUNT);
+  }
+
+  definitions(): Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> {
+    return [...this.tools.values()].map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.name === 'spawn_agent' ? this.spawnSchema(t.inputSchema) : t.inputSchema,
+    }));
+  }
+
+  /** spawn_agent's kind is an enum of the effective harness list (priority
+   *  order) so the model picks from real choices instead of guessing names. */
+  private spawnSchema(base: Record<string, unknown>): Record<string, unknown> {
+    const properties = { ...((base.properties as Record<string, unknown> | undefined) ?? {}) };
+    properties.kind = {
+      type: 'string',
+      enum: this.harnesses,
+      description: 'harness to boot — slot 1 is the default; empty = remembered pick or default',
+    };
+    return { ...base, properties };
+  }
+
+  async run(name: string, args: Record<string, unknown>, ctx: ReviewerToolContext): Promise<string> {
+    const tool = this.tools.get(name);
+    if (!tool) return `error: unknown tool ${name}`;
+    // the constructor list is the single source of truth — hand it to the
+    // spawn run unless the caller already supplied one (main.ts does)
+    const merged =
+      name === 'spawn_agent' && !ctx.getHarnesses ? { ...ctx, getHarnesses: () => this.harnesses } : ctx;
+    try {
+      return await tool.run(args, merged);
+    } catch (err) {
+      return `error: ${(err as Error).message}`;
+    }
+  }
+}
+
+/** Ledger task ids must be unique per session; a per-process counter keeps
+ *  them distinct even when two upserts land in the same ms. */
+let taskSeq = 0;
+function newTaskId(): string {
+  taskSeq += 1;
+  return `t-${Date.now()}-${taskSeq}`;
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+/** Directories that are never worth browsing or searching. */
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', '.hg', '.svn', 'dist', 'build', 'out', 'coverage',
+  '.cache', 'target', '.venv', 'venv', '__pycache__', '.next', '.turbo',
+]);
+
+const LIST_ENTRY_CAP = 500;
+
+async function listDir(abs: string, depth: number, includeHidden: boolean): Promise<string> {
+  const out: string[] = [];
+  const walk = async (dir: string, remaining: number): Promise<void> => {
+    if (out.length >= LIST_ENTRY_CAP) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      out.push(`error: ${(err as NodeJS.ErrnoException).message}`);
+      return;
+    }
+    entries.sort((a, b) =>
+      a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1,
+    );
+    for (const e of entries) {
+      if (out.length >= LIST_ENTRY_CAP) {
+        out.push('...[entry cap reached]');
+        return;
+      }
+      if (!includeHidden && e.name.startsWith('.')) continue;
+      const full = join(dir, e.name);
+      const rel = relative(abs, full);
+      if (e.isDirectory()) {
+        // heavy dirs are always skipped from the listing — the depth guard
+        // only governs recursion (audit RV-27)
+        if (SKIP_DIRS.has(e.name)) continue;
+        out.push(`${rel}/`);
+        if (remaining > 1) await walk(full, remaining - 1);
+      } else {
+        let size = 0;
+        try {
+          size = (await stat(full)).size;
+        } catch {
+          continue; // broken symlink or unreadable
+        }
+        out.push(`${rel} (${size} B)`);
+      }
+    }
+  };
+  await walk(abs, Math.max(1, Math.min(3, depth)));
+  return out.length > 0 ? out.join('\n') : '(empty)';
+}
+
+/** Runs the search in a worker thread under a hard timeout: a model-supplied
+ *  regex with catastrophic backtracking can burn that thread but never the
+ *  main process (audit SEC-6). Falls back in-process only when the worker
+ *  bundle is absent (unit tests). */
+async function searchFiles(
+  pattern: string,
+  abs: string,
+  glob: string | undefined,
+  maxMatches: number,
+  display: string,
+): Promise<string> {
+  const req: SearchRequest = { pattern, abs, glob, maxMatches, display };
+  const workerFile = join(__dirname, 'search-worker.cjs');
+  if (!existsSync(workerFile)) return runSearch(req);
+  return new Promise<string>((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const worker = new Worker(workerFile, { workerData: req });
+    const finish = (text: string): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      void worker.terminate();
+      resolve(text);
+    };
+    timer = setTimeout(() => finish('error: search timed out'), SEARCH_WORKER_TIMEOUT_MS);
+    worker.once('message', (msg: { text?: unknown }) => {
+      finish(typeof msg?.text === 'string' ? msg.text : 'error: search failed');
+    });
+    worker.once('error', (err) => finish(`error: ${err.message}`));
+  });
+}
+
+/** Confines a reviewer read to the project scope (registered roots or the
+ *  session cwd); symlink-aware. Returns null when the path escapes. */
+async function confineRead(abs: string, ctx: ReviewerToolContext): Promise<string | null> {
+  const roots = ctx.roots !== undefined && ctx.roots.length > 0 ? ctx.roots : [ctx.cwd];
+  return confinePath(roots, abs);
+}
+
+/** Timestamp formatting that can never throw on a legacy/corrupt row (an
+ *  invalid date used to hide the whole audit log — audit RV-20). */
+function safeIso(at: number | undefined): string {
+  return typeof at === 'number' && Number.isFinite(at) ? new Date(at).toISOString() : 'unknown';
+}
+
+/** Reads at most READ_CAP_BYTES of a file: the tool result is capped
+ *  downstream anyway (20K chars), so buffering up to 8×4MiB per call just to
+ *  throw most of it away is pure main-process memory pressure (audit RV-I6). */
+const READ_CAP_BYTES = 65_536;
+async function readTextCapped(abs: string): Promise<string> {
+  const fh = await open(abs, 'r');
+  try {
+    const buf = Buffer.alloc(READ_CAP_BYTES);
+    const { bytesRead } = await fh.read(buf, 0, READ_CAP_BYTES, 0);
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+    return bytesRead >= READ_CAP_BYTES ? `${text}\n...[truncated at ${READ_CAP_BYTES} bytes]` : text;
+  } finally {
+    await fh.close();
+  }
+}
+

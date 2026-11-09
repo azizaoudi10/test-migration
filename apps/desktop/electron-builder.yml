@@ -1,0 +1,81 @@
+appId: com.fraktole.desktop
+productName: Fraktole
+executableName: fraktole-desktop
+directories:
+  output: release
+files:
+  - dist-electron/**
+  - dist-renderer/**
+  - package.json
+  - build/icon.png
+  # every prod dependency is bundled into dist-electron/main.cjs (esbuild)
+  # or dist-renderer (vite) except the native node-pty — shipping the rest
+  # of node_modules was ~12MB of dead weight (dev builds, .map files,
+  # darwin/win32 prebuilds) that runtime code never resolves
+  - '!node_modules/**'
+  - node_modules/node-pty/**
+  # the loader only consults build/Release, build/Debug and
+  # prebuilds/<platform>-<arch>; foreign prebuilds, sources, winpty deps,
+  # helper scripts and test files are dead weight
+  - '!node_modules/node-pty/prebuilds/darwin-*/**'
+  - '!node_modules/node-pty/prebuilds/win32-*/**'
+  - '!node_modules/node-pty/src/**'
+  - '!node_modules/node-pty/deps/**'
+  - '!node_modules/node-pty/scripts/**'
+  - '!node_modules/node-pty/bin/**'
+  - '!node_modules/node-pty/**/*.test.*'
+  # font files shipped as extra resources
+  - src/assets/fonts/**
+# 55 locale .pak files ship by default (~38MB unpacked); the UI is English
+electronLanguages:
+  - en-US
+# static AppImage runtime: no libfuse.so.2 dependency (absent by default on
+# modern Ubuntu); the generated AppRun already probes user namespaces and
+# only passes --no-sandbox when they are unavailable
+toolsets:
+  appimage: 1.0.3
+# code signing configuration (placeholder; fill in with real certificates)
+win:
+  target:
+    - nsis
+  icon: build/icon.png
+  artifactName: ${productName}-${version}-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: true
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.png
+  uninstallerIcon: build/icon.png
+  installerHeaderIcon: build/icon.png
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+mac:
+  target:
+    - dmg
+  icon: build/icon.png
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  category: Development
+  hardenedRuntime: true
+  gatekeeperAssess: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+linux:
+  target:
+    - dir
+    - AppImage
+  icon: build/icons
+  category: Development
+  maintainer: Fraktole
+  artifactName: ${productName}-${version}-${arch}.${ext}
+appImage:
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  # never force --no-sandbox from the desktop entry; AppRun decides
+  executableArgs: []
+extraResources:
+  - src/assets/fonts/**
+# installs the curated AppRun (GTK env sanitization + sandbox probe) over the
+# generated one; see scripts/after-pack.cjs
+afterPack: scripts/after-pack.cjs
+# node-pty is rebuilt for the bundled Electron ABI at package time
+npmRebuild: true
